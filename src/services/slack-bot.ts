@@ -1282,12 +1282,10 @@ async function handlePutSecret(
 
 async function handleRememberPerson(input: { user_id: string; name: string; note: string }): Promise<void> {
   const { readFileSync, writeFileSync, mkdirSync } = await import('fs');
-  const { resolve, dirname } = await import('path');
-  const { fileURLToPath } = await import('url');
+  const { resolve } = await import('path');
   const { execSync } = await import('child_process');
 
-  const __dirname = dirname(fileURLToPath(import.meta.url));
-  const peopleFile = resolve(__dirname, '../../../config/people.json');
+  const peopleFile = resolve(process.cwd(), 'config/people.json');
 
   try {
     type PersonEntry = { id: string; name: string; notes: string[] };
@@ -1305,18 +1303,16 @@ async function handleRememberPerson(input: { user_id: string; name: string; note
       people.push({ id: input.user_id, name: input.name, notes: [input.note] });
     }
 
-    mkdirSync(dirname(peopleFile), { recursive: true });
     writeFileSync(peopleFile, JSON.stringify({ people }, null, 2));
 
     // Also update in-memory config so the current session has the new note
     config().peopleNotes = people;
 
-    const repoRoot = resolve(__dirname, '../../..');
     execSync(
-      `git -C "${repoRoot}" add config/people.json && ` +
-      `git -C "${repoRoot}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
+      `git -C "${process.cwd()}" add config/people.json && ` +
+      `git -C "${process.cwd()}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
       `commit -m "memory: remember note about ${input.name}" && ` +
-      `git -C "${repoRoot}" push origin main`,
+      `git -C "${process.cwd()}" push origin main`,
       { stdio: 'pipe' },
     );
     logger.info({ action: 'remember_person:persisted', userId: input.user_id }, 'Memory saved to GitHub');

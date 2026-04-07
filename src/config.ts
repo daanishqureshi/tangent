@@ -14,13 +14,15 @@ import {
 } from '@aws-sdk/client-secrets-manager';
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { execSync } from 'child_process';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { resolve } from 'path';
 import { logger } from './utils/logger.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const ALLOWED_USERS_FILE = resolve(__dirname, '../../config/allowed_users.json');
-const PEOPLE_FILE        = resolve(__dirname, '../../config/people.json');
+// Use process.cwd() — always the project root when run via pm2.
+// __dirname cannot be used here because rootDir="src" + outDir="dist" puts
+// the compiled file at dist/config.js, making relative paths one level off.
+const PROJECT_ROOT       = process.cwd();
+const ALLOWED_USERS_FILE = resolve(PROJECT_ROOT, 'config/allowed_users.json');
+const PEOPLE_FILE        = resolve(PROJECT_ROOT, 'config/people.json');
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -96,15 +98,13 @@ export function allowUser(userId: string): void {
 
     if (!existing.includes(userId)) {
       existing.push(userId);
-      mkdirSync(dirname(ALLOWED_USERS_FILE), { recursive: true });
       writeFileSync(ALLOWED_USERS_FILE, JSON.stringify({ allowedUserIds: existing }, null, 2));
 
-      const repoRoot = resolve(__dirname, '../..');
       execSync(
-        `git -C "${repoRoot}" add config/allowed_users.json && ` +
-        `git -C "${repoRoot}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
+        `git -C "${PROJECT_ROOT}" add config/allowed_users.json && ` +
+        `git -C "${PROJECT_ROOT}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
         `commit -m "chore: allow user ${userId}" && ` +
-        `git -C "${repoRoot}" push origin main`,
+        `git -C "${PROJECT_ROOT}" push origin main`,
         { stdio: 'pipe' },
       );
       logger.info({ action: 'config:allow_user:persisted', userId }, 'Allowed user persisted to GitHub');
