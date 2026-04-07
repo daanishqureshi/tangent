@@ -1,0 +1,39 @@
+{
+  "name": "tangent",
+  "version": "1.0.0",
+  "description": "Impiricus internal DevOps AI agent — build, deploy, monitor, teardown ECS Fargate services",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "build:mcp": "tsc -p mcp/tsconfig.json",
+    "build:all": "npm run build && npm run build:mcp",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@modelcontextprotocol/sdk": "^1.10.2",
+    "@aws-sdk/client-cloudwatch-logs": "^3.787.0",
+    "@aws-sdk/client-ec2": "^3.1024.0",
+    "@aws-sdk/client-ecr": "^3.787.0",
+    "@aws-sdk/client-ecs": "^3.787.0",
+    "@aws-sdk/client-iam": "^3.1024.0",
+    "@aws-sdk/client-secrets-manager": "^3.787.0",
+    "@octokit/rest": "^21.1.1",
+    "@slack/bolt": "^4.6.0",
+    "@slack/web-api": "^7.9.1",
+    "dotenv": "^17.4.0",
+    "fastify": "^5.3.2",
+    "node-cron": "^3.0.3",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.14",
+    "@types/node-cron": "^3.0.11",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

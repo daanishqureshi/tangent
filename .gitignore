@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+*.log
+*.pem
+mcp/node_modules/
+mcp/dist/

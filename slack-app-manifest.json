@@ -1,0 +1,44 @@
+{
+  "_metadata": {
+    "major_version": 1,
+    "minor_version": 1
+  },
+  "display_information": {
+    "name": "Tangent",
+    "description": "Impiricus DevOps agent — deploy, monitor, and manage internal vibe-code projects",
+    "background_color": "#1a1a2e",
+    "long_description": "Tangent is the Impiricus internal DevOps AI agent. Mention @Tangent in any channel with plain English to deploy repos, check status, tear down services, or run CVE scans. No slash commands needed."
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Tangent",
+      "always_online": true
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "channels:history",
+        "groups:history",
+        "im:history",
+        "chat:write",
+        "chat:write.public"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "app_mention",
+        "message.im"
+      ]
+    },
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false,
+    "org_deploy_enabled": false,
+    "interactivity": {
+      "is_enabled": false
+    }
+  }
+}
