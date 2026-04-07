@@ -12,7 +12,14 @@ import {
   SecretsManagerClient,
   GetSecretValueCommand,
 } from '@aws-sdk/client-secrets-manager';
+import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { execSync } from 'child_process';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { logger } from './utils/logger.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ALLOWED_USERS_FILE = resolve(__dirname, '../../config/allowed_users.json');
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -74,9 +81,36 @@ export function config(): Config {
   return _config;
 }
 
-/** Dynamically add a Slack user ID to the allowed list at runtime. */
+/** Dynamically add a Slack user ID to the allowed list at runtime, and persist to GitHub. */
 export function allowUser(userId: string): void {
   config().allowedSlackUserIds.add(userId);
+
+  // Persist to config/allowed_users.json and push to GitHub so it survives redeploys
+  try {
+    let existing: string[] = [];
+    try {
+      existing = (JSON.parse(readFileSync(ALLOWED_USERS_FILE, 'utf8')) as { allowedUserIds: string[] }).allowedUserIds;
+    } catch { /* file missing or malformed — start fresh */ }
+
+    if (!existing.includes(userId)) {
+      existing.push(userId);
+      mkdirSync(dirname(ALLOWED_USERS_FILE), { recursive: true });
+      writeFileSync(ALLOWED_USERS_FILE, JSON.stringify({ allowedUserIds: existing }, null, 2));
+
+      const repoRoot = resolve(__dirname, '../..');
+      execSync(
+        `git -C "${repoRoot}" add config/allowed_users.json && ` +
+        `git -C "${repoRoot}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
+        `commit -m "chore: allow user ${userId}" && ` +
+        `git -C "${repoRoot}" push origin main`,
+        { stdio: 'pipe' },
+      );
+      logger.info({ action: 'config:allow_user:persisted', userId }, 'Allowed user persisted to GitHub');
+    }
+  } catch (err) {
+    // Never let persistence failure break the in-memory grant
+    logger.warn({ action: 'config:allow_user:persist_failed', userId, err }, 'Failed to persist allowed user to GitHub');
+  }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -133,6 +167,12 @@ export async function loadConfig(): Promise<Config> {
       .map((id) => id.trim())
       .filter(Boolean),
   );
+  // Merge in any users persisted via allowUser() across previous restarts
+  try {
+    const persisted = (JSON.parse(readFileSync(ALLOWED_USERS_FILE, 'utf8')) as { allowedUserIds: string[] }).allowedUserIds;
+    for (const id of persisted) allowedSlackUserIds.add(id);
+    logger.info({ action: 'config:load_allowed_users', count: persisted.length }, 'Loaded persisted allowed users');
+  } catch { /* file not yet created — fine */ }
   const githubOrg = optionalEnv('GITHUB_ORG', 'impiricus');
   const scaffoldChildTopic = optionalEnv('SCAFFOLD_CHILD_TOPIC', 'impiricus-scaffold-child');
   const workspaceDir = optionalEnv('WORKSPACE_DIR', '/tmp/tangent-workspace');
