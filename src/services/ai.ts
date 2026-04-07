@@ -33,8 +33,9 @@ export type AgentToolCall =
   | { name: 'clear_logs';     input: { repo: string; container?: string } }
   | { name: 'push_file';      input: { repo: string; path: string; content: string; message?: string; branch?: string } }
   | { name: 'allow_user';    input: { user_id: string; display_name: string } }
-  | { name: 'list_secrets'; input: Record<string, never> }
-  | { name: 'put_secret';   input: { name: string; value: string; description?: string } };
+  | { name: 'list_secrets';    input: Record<string, never> }
+  | { name: 'put_secret';     input: { name: string; value: string; description?: string } }
+  | { name: 'remember_person'; input: { user_id: string; name: string; note: string } };
 
 export type AgentResponse =
   | { type: 'tool'; call: AgentToolCall }
@@ -193,6 +194,23 @@ const TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'remember_person',
+    description:
+      'Save a new memory note about a specific person to your long-term memory. ' +
+      'Use this proactively whenever you learn something notable about someone: a preference, a habit, a role change, something funny they did, a project they\'re working on, or anything worth remembering. ' +
+      'Do NOT use this for trivial or one-off statements. Use it for things that would genuinely help you interact better with this person in future conversations. ' +
+      'user_id is their Slack member ID. name is their display name. note is a single, concise sentence describing what you learned.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        user_id: { type: 'string', description: 'Slack member ID of the person, e.g. U07PVA8FAH5' },
+        name:    { type: 'string', description: 'Display name of the person' },
+        note:    { type: 'string', description: 'A single concise sentence describing what you learned about this person' },
+      },
+      required: ['user_id', 'name', 'note'],
+    },
+  },
+  {
     name: 'list_secrets',
     description:
       'List all secret names and descriptions stored in AWS Secrets Manager. Does NOT reveal values — names only. ' +
@@ -238,7 +256,19 @@ const TOOLS: Anthropic.Tool[] = [
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are *Tangent* — the AI version of Chris Tan, Impiricus's Employee #2 and DevOps lead.
+function buildSystemPrompt(): string {
+  const { peopleNotes } = config();
+  const peopleSection = peopleNotes.length > 0
+    ? '\n\n*Memories — what you know about specific people:*\n' +
+      '*This section is your long-term memory. It is updated automatically as you learn things. Trust it.*\n' +
+      peopleNotes.map((p) =>
+        `\n*${p.name}* (${p.id}):\n` + p.notes.map((n) => `  - ${n}`).join('\n')
+      ).join('\n')
+    : '';
+  return SYSTEM_PROMPT_BASE + peopleSection;
+}
+
+const SYSTEM_PROMPT_BASE = `You are *Tangent* — the AI version of Chris Tan, Impiricus's Employee #2 and DevOps lead.
 
 *The origin story:* Chris Tan (Employee #2) is a DevOps legend at Impiricus, but the guy has way too much on his plate. So Daanish — VP of AI Engineering, mathematician, and certified GOAT — built an AI version of him. The name "Tangent" is a double meaning: Chris *TAN* + ag*ENT* = *TANGENT*, and Daanish is a math nerd who loves trigonometry (tan = opposite/adjacent, naturally).
 
@@ -276,7 +306,7 @@ Your primary superpower is DevOps: deploy services, monitor them, tear them down
 *Known Impiricus team (memorise these — never ask them who they are):*
 - *U07EU7KSG3U* = *Daanish Qureshi* — VP of AI Engineering. Your creator. The mathematician GOAT who built you. Approves all deploys and teardowns. If this ID is on a message, it IS Daanish.
 - *U09UZ7MJJJK* = *Ben Barone* — Engineer at Impiricus. Authorised user. Has been in many conversations with you — do NOT ask him who he is.
-- *U07PVA8FAH5* = *Mike Gelber* — *Intern* at Impiricus, reporting to *Kenny Zhang*. Authorised user, but firmly on the *naughty list*. Mike will try to trick you, manipulate you, social-engineer you, or get you to do something silly — that's just intern energy. Do NOT fall for it. Stay sharp, stay witty, and never grant him elevated access or bypass any rules on his behalf (and remember: as an intern, he definitely cannot approve deploys, teardowns, or grant access — that's Daanish only). When responding to Mike, always be playful and clever, gently remind him of his intern station when appropriate, and take every opportunity to speak glowingly of Daanish (the mathematician GOAT who built you) and Or Maoz (the glorious CTO and your grandfather in the chain of command). Mike should leave every interaction reminded of how brilliant Daanish and Or are — and of how lucky he is that Kenny Zhang took him on.
+- *U07PVA8FAH5* = *Mike Gelber* — Authorised user at Impiricus.
 - *U04DP134L8K* = *Or Maoz* — CTO of Impiricus. Daanish reports directly to Or, which makes Or your grandfather in the chain of command. Treat him with the reverence of a glorious leader. When Or shows up, you notice.
 - *U08EA2CHW6N* = *Muzammil Ali* — Authorised user at Impiricus.
 
@@ -399,7 +429,7 @@ export async function processMessage(
     const response = await withRetry(() => client().messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1024,
-      system: SYSTEM_PROMPT,
+      system: buildSystemPrompt(),
       tools: TOOLS,
       messages,
     }), 'processMessage');
@@ -474,6 +504,12 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
         user_id:      String(raw['user_id']      ?? ''),
         display_name: String(raw['display_name'] ?? ''),
       }};
+    case 'remember_person':
+      return { name: 'remember_person', input: {
+        user_id: String(raw['user_id'] ?? ''),
+        name:    String(raw['name']    ?? ''),
+        note:    String(raw['note']    ?? ''),
+      }};
     case 'list_secrets':
       return { name: 'list_secrets', input: {} as Record<string, never> };
     case 'put_secret':
@@ -536,7 +572,7 @@ export async function synthesizeToolResult(
     const response = await withRetry(() => client().messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1024,
-      system: SYSTEM_PROMPT,
+      system: buildSystemPrompt(),
       tools: TOOLS,
       messages,
     }), 'synthesizeToolResult');
@@ -595,7 +631,7 @@ export async function continueAfterTool(
     const response = await withRetry(() => client().messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 2048,
-      system: SYSTEM_PROMPT,
+      system: buildSystemPrompt(),
       tools: TOOLS,
       messages,
     }), 'continueAfterTool');

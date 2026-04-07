@@ -20,6 +20,7 @@ import { logger } from './utils/logger.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ALLOWED_USERS_FILE = resolve(__dirname, '../../config/allowed_users.json');
+const PEOPLE_FILE        = resolve(__dirname, '../../config/people.json');
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -56,6 +57,7 @@ export interface Config {
   // Slack
   slackChannel: string;
   allowedSlackUserIds: Set<string>; // empty = allow everyone
+  peopleNotes: { id: string; name: string; notes: string[] }[];
 
   // GitHub
   githubOrg: string;
@@ -167,6 +169,12 @@ export async function loadConfig(): Promise<Config> {
       .map((id) => id.trim())
       .filter(Boolean),
   );
+  // Load per-person context notes
+  let peopleNotes: Array<{ id: string; name: string; notes: string[] }> = [];
+  try {
+    peopleNotes = (JSON.parse(readFileSync(PEOPLE_FILE, 'utf8')) as { people: typeof peopleNotes }).people;
+  } catch { /* file missing — fine */ }
+
   // Merge in any users persisted via allowUser() across previous restarts
   try {
     const persisted = (JSON.parse(readFileSync(ALLOWED_USERS_FILE, 'utf8')) as { allowedUserIds: string[] }).allowedUserIds;
@@ -244,6 +252,7 @@ export async function loadConfig(): Promise<Config> {
     slackAppToken,
     slackChannel,
     allowedSlackUserIds,
+    peopleNotes,
     githubOrg,
     scaffoldChildTopic,
     port,

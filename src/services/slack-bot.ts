@@ -515,6 +515,9 @@ async function executeToolCall(
     case 'put_secret':
       await handlePutSecret(ctx, call.input as { name: string; value: string; description?: string }, convKey);
       break;
+    case 'remember_person':
+      await handleRememberPerson(call.input as { user_id: string; name: string; note: string });
+      break;
     default:
       // Informational tools: fetch data, synthesize a conversational response via Claude
       await handleInfoTool(call, ctx, convKey, userMessage, history);
@@ -1253,6 +1256,51 @@ async function handlePutSecret(
     const msg = `❌ Failed to save secret \`${input.name}\`: ${err instanceof Error ? err.message : String(err)}`;
     await update(ctx.client, ctx.channel, ts, msg);
     _appendTurn(convKey, { role: 'assistant', content: msg });
+  }
+}
+
+async function handleRememberPerson(input: { user_id: string; name: string; note: string }): Promise<void> {
+  const { readFileSync, writeFileSync, mkdirSync } = await import('fs');
+  const { resolve, dirname } = await import('path');
+  const { fileURLToPath } = await import('url');
+  const { execSync } = await import('child_process');
+
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const peopleFile = resolve(__dirname, '../../../config/people.json');
+
+  try {
+    type PersonEntry = { id: string; name: string; notes: string[] };
+    let people: PersonEntry[] = [];
+    try {
+      people = (JSON.parse(readFileSync(peopleFile, 'utf8')) as { people: PersonEntry[] }).people;
+    } catch { /* file missing — start fresh */ }
+
+    const existing = people.find((p) => p.id === input.user_id);
+    if (existing) {
+      if (!existing.notes.includes(input.note)) {
+        existing.notes.push(input.note);
+      }
+    } else {
+      people.push({ id: input.user_id, name: input.name, notes: [input.note] });
+    }
+
+    mkdirSync(dirname(peopleFile), { recursive: true });
+    writeFileSync(peopleFile, JSON.stringify({ people }, null, 2));
+
+    // Also update in-memory config so the current session has the new note
+    config().peopleNotes = people;
+
+    const repoRoot = resolve(__dirname, '../../..');
+    execSync(
+      `git -C "${repoRoot}" add config/people.json && ` +
+      `git -C "${repoRoot}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
+      `commit -m "memory: remember note about ${input.name}" && ` +
+      `git -C "${repoRoot}" push origin main`,
+      { stdio: 'pipe' },
+    );
+    logger.info({ action: 'remember_person:persisted', userId: input.user_id }, 'Memory saved to GitHub');
+  } catch (err) {
+    logger.warn({ action: 'remember_person:failed', err }, 'Failed to persist person memory');
   }
 }
 
