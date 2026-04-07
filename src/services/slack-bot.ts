@@ -314,10 +314,29 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
     _markActiveThread(ctx.channel, ctx.threadTs);
   }
 
+  // ── Resolve userId early — used for access control, identity prefix, and all tool gates ──
+  // Mutate ctx.userId so every downstream function (handleDeploy, executeToolCall, etc.)
+  // automatically gets the resolved identity without needing to pass it separately.
+  let resolvedUserId = ctx.userId;
+  if (!resolvedUserId) {
+    try {
+      const info = await ctx.client.conversations.info({ channel: ctx.channel });
+      const channelUser = (info.channel as Record<string, unknown>)?.['user'];
+      if (typeof channelUser === 'string') resolvedUserId = channelUser;
+    } catch { /* best-effort */ }
+    if (resolvedUserId) {
+      logger.info({ action: 'slack_bot:resolved_user', userId: resolvedUserId }, 'Resolved missing userId via conversations.info');
+    } else {
+      logger.warn({ action: 'slack_bot:unknown_user', channel: ctx.channel }, 'Could not resolve userId');
+    }
+  }
+  // Propagate to ctx so all downstream functions use the resolved identity
+  ctx.userId = resolvedUserId;
+
   // Access control
   const { allowedSlackUserIds } = config();
-  if (allowedSlackUserIds.size > 0 && (!ctx.userId || !allowedSlackUserIds.has(ctx.userId))) {
-    logger.warn({ action: 'slack_bot:unauthorized', userId: ctx.userId }, 'Unauthorized user');
+  if (allowedSlackUserIds.size > 0 && (!resolvedUserId || !allowedSlackUserIds.has(resolvedUserId))) {
+    logger.warn({ action: 'slack_bot:unauthorized', userId: resolvedUserId }, 'Unauthorized user');
     await post(ctx.client, ctx.channel, ctx.threadTs, "Sorry, you're not authorized to use Tangent.");
     return;
   }
@@ -326,7 +345,7 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
   // Usage (DM or mention): "add @username" / "allow @username"
   const addUserMatch = /^(?:add|allow)\s+<@([A-Z0-9]+)>/i.exec(text.trim());
   if (addUserMatch) {
-    if (ctx.userId !== 'U07EU7KSG3U') {
+    if (resolvedUserId !== 'U07EU7KSG3U') {
       await post(ctx.client, ctx.channel, ctx.threadTs, '🔒 Only Daanish can add users to the allowed list.');
       return;
     }
@@ -375,7 +394,9 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
   const history = await buildHistory(ctx.client, convKey, ctx.channel, ctx.threadTs, messageTs, source);
 
   // Prefix message with real Slack identity so Claude can never be fooled by verbal claims
-  const identityPrefix = ctx.userId ? `[Slack User: <@${ctx.userId}> | ID: ${ctx.userId}]\n` : '';
+  const identityPrefix = resolvedUserId
+    ? `[Slack User: <@${resolvedUserId}> | ID: ${resolvedUserId}]\n`
+    : '[Slack User: UNKNOWN — identity could not be resolved]\n';
   const textWithIdentity = identityPrefix + text;
 
   // Store the identity-prefixed version so DM history carries the same
