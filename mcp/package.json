@@ -1,0 +1,24 @@
+{
+  "name": "tangent-mcp",
+  "version": "1.0.0",
+  "description": "Tangent MCP server — deploy and manage Impiricus services from Claude Code or Cursor",
+  "type": "module",
+  "bin": {
+    "tangent-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist/**"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.2",
+    "@slack/web-api": "^7.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.14",
+    "typescript": "^5.8.2"
+  }
+}
