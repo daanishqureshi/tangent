@@ -656,6 +656,12 @@ async function fetchToolData(call: AgentToolCall): Promise<string> {
       return fetchListRepos();
     case 'inspect_repo':
       return fetchInspectRepo((call.input as { repo: string }).repo);
+    case 'read_file': {
+      const { repo, path } = call.input as { repo: string; path: string };
+      const content = await readRepoFile(repo, path);
+      if (content === null) return `File not found: ${path} in ${repo}`;
+      return `File: ${path}\n\`\`\`\n${content}\n\`\`\``;
+    }
     case 'cve_scan':
       return fetchScan();
     case 'discover_config':

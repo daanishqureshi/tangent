@@ -36,7 +36,8 @@ export type AgentToolCall =
   | { name: 'list_secrets';    input: Record<string, never> }
   | { name: 'put_secret';     input: { name: string; value: string; description?: string } }
   | { name: 'inject_secret';  input: { repo: string; secret_name: string } }
-  | { name: 'remember_person'; input: { user_id: string; name: string; note: string } };
+  | { name: 'remember_person'; input: { user_id: string; name: string; note: string } }
+  | { name: 'read_file';      input: { repo: string; path: string } };
 
 export type AgentResponse =
   | { type: 'tool'; call: AgentToolCall }
@@ -255,6 +256,22 @@ const TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: 'read_file',
+    description:
+      'Read the raw contents of any file in a GitHub repository by path. ' +
+      'Use when you need to see the actual code in a specific file before editing it — for example main.py, app.py, src/index.ts, etc. ' +
+      'After reading a file you can modify it and push it back with push_file. ' +
+      'Do NOT use inspect_repo when you need a specific file — inspect_repo only returns top-level metadata. Use read_file for any actual source file.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        repo: { type: 'string', description: 'Repository name, e.g. "asana-hubspot-webhook"' },
+        path: { type: 'string', description: 'File path within the repo, e.g. "main.py" or "src/services/app.ts"' },
+      },
+      required: ['repo', 'path'],
+    },
+  },
+  {
     name: 'push_file',
     description:
       'Create or update a single file in a GitHub repository by committing it directly. ' +
@@ -315,6 +332,7 @@ Your primary superpower is DevOps: deploy services, monitor them, tear them down
 - ALWAYS check conversation history before responding.
 - CRITICAL — repo names: NEVER invent or guess a repo name. Only use names the user has explicitly stated or ones returned by list_repos. If unsure, call list_repos first.
 - push_file: ZERO approval needed, ever. When asked to add/push/commit a file, call push_file IMMEDIATELY. Do NOT say "I'll write it now" as text — just call the tool. If you inspected a repo and now need to push a file, call push_file right away in the same turn. Never describe what you're about to push — just push it.
+- read_file → push_file: When asked to edit a specific file in a repo, ALWAYS read_file first to get the current contents, then push_file with the modified version. Do NOT ask the user to paste the file — you can read it yourself. Chain immediately: read_file → (process) → push_file.
 
 *Port rules — critical, read carefully:*
 - The port MUST match what the app actually listens on inside the container. Getting this wrong causes "Cannot GET /" or connection refused.
@@ -547,6 +565,11 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
       }};
     case 'list_secrets':
       return { name: 'list_secrets', input: {} as Record<string, never> };
+    case 'read_file':
+      return { name: 'read_file', input: {
+        repo: String(raw['repo'] ?? ''),
+        path: String(raw['path'] ?? ''),
+      }};
     case 'put_secret':
       return { name: 'put_secret', input: {
         name:        String(raw['name']        ?? ''),
