@@ -241,19 +241,47 @@ export async function pushFile(
 }
 
 /**
- * Read a single file from a repo by path.
+ * Read a single file from a repo by path, optionally at a specific commit SHA or branch.
  * Returns the decoded UTF-8 content, or null if the file doesn't exist or isn't readable.
  */
-export async function readRepoFile(repo: string, filePath: string): Promise<string | null> {
+export async function readRepoFile(repo: string, filePath: string, ref?: string): Promise<string | null> {
   const { githubOrg } = config();
   try {
-    const res = await octokit().repos.getContent({ owner: githubOrg, repo, path: filePath });
+    const res = await octokit().repos.getContent({ owner: githubOrg, repo, path: filePath, ...(ref ? { ref } : {}) });
     const file = res.data as { type: string; content?: string; encoding?: string };
     if (file.type !== 'file' || !file.content) return null;
     return Buffer.from(file.content, (file.encoding as BufferEncoding) ?? 'base64').toString('utf-8');
   } catch {
     return null;
   }
+}
+
+export interface CommitInfo {
+  sha: string;
+  shortSha: string;
+  message: string;
+  author: string;
+  date: string;
+}
+
+/**
+ * List recent commits for a repo, optionally filtered to a specific file path.
+ */
+export async function listCommits(repo: string, filePath?: string, limit = 20): Promise<CommitInfo[]> {
+  const { githubOrg } = config();
+  const { data } = await octokit().repos.listCommits({
+    owner: githubOrg,
+    repo,
+    per_page: limit,
+    ...(filePath ? { path: filePath } : {}),
+  });
+  return data.map((c) => ({
+    sha: c.sha,
+    shortSha: c.sha.slice(0, 7),
+    message: c.commit.message.split('\n')[0] ?? '',
+    author: c.commit.author?.name ?? c.commit.committer?.name ?? 'unknown',
+    date: c.commit.author?.date ?? c.commit.committer?.date ?? '',
+  }));
 }
 
 /**

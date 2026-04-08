@@ -27,7 +27,7 @@ import { tunnelSkill, TunnelTimeoutError } from '../skills/tunnel.js';
 import { teardownSkill } from '../skills/teardown.js';
 import { scanSkill } from '../skills/scan.js';
 import { discoverSkill } from '../skills/discover.js';
-import { listAllRepos, inspectRepo, pushFile, readRepoFile } from './github.js';
+import { listAllRepos, inspectRepo, pushFile, readRepoFile, listCommits } from './github.js';
 import { logger } from '../utils/logger.js';
 
 // ─── App singleton ────────────────────────────────────────────────────────────
@@ -472,6 +472,37 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
     return;
   }
 
+  if (call.name === 'push_file') {
+    const { repo, path: filePath, content, branch = 'main', message } = call.input as {
+      repo: string; path: string; content: string; branch?: string; message?: string;
+    };
+
+    // Check if file already exists — new files go through immediately, updates need confirmation
+    const existingContent = await readRepoFile(repo, filePath, branch).catch(() => null);
+    if (existingContent !== null) {
+      // File exists — show a preview and require Daanish to confirm before overwriting
+      const preview = content.length > 400 ? content.slice(0, 400) + '\n...(truncated)' : content;
+      const commitMsg = message ?? `Update ${filePath} via Tangent`;
+      const prompt = [
+        `✏️ *Push to existing file \`${filePath}\` in \`${repo}\`*`,
+        `• Branch: \`${branch}\``,
+        `• Commit message: _${commitMsg}_`,
+        '',
+        '*New content preview:*',
+        '```',
+        preview,
+        '```',
+        '',
+        `<@${APPROVER_ID}> — reply *yes* to push or *no* to cancel.`,
+      ].join('\n');
+      _setPending(convKey, call, prompt, APPROVER_ID, ctx.userId);
+      await post(ctx.client, ctx.channel, ctx.threadTs, prompt);
+      _appendTurn(convKey, { role: 'assistant', content: prompt });
+      return;
+    }
+    // New file — no confirmation needed, fall through to executeToolCall
+  }
+
   if (call.name === 'teardown') {
     const { repo } = call.input as { repo: string };
 
@@ -657,10 +688,19 @@ async function fetchToolData(call: AgentToolCall): Promise<string> {
     case 'inspect_repo':
       return fetchInspectRepo((call.input as { repo: string }).repo);
     case 'read_file': {
-      const { repo, path } = call.input as { repo: string; path: string };
-      const content = await readRepoFile(repo, path);
-      if (content === null) return `File not found: ${path} in ${repo}`;
-      return `File: ${path}\n\`\`\`\n${content}\n\`\`\``;
+      const { repo, path, ref } = call.input as { repo: string; path: string; ref?: string };
+      const content = await readRepoFile(repo, path, ref);
+      if (content === null) return `File not found: ${path} in ${repo}${ref ? ` at ref ${ref}` : ''}`;
+      const refNote = ref ? ` (at commit ${ref.slice(0, 7)})` : '';
+      return `File: ${path}${refNote}\n\`\`\`\n${content}\n\`\`\``;
+    }
+    case 'list_commits': {
+      const { repo, path, limit } = call.input as { repo: string; path?: string; limit?: number };
+      const commits = await listCommits(repo, path, limit ?? 20);
+      if (commits.length === 0) return `No commits found for ${repo}${path ? ` (${path})` : ''}`;
+      const lines = commits.map((c) => `\`${c.shortSha}\` ${c.date.slice(0, 10)} *${c.author}*: ${c.message}`);
+      const header = path ? `Commits touching \`${path}\` in \`${repo}\`:` : `Recent commits in \`${repo}\`:`;
+      return `${header}\n${lines.join('\n')}`;
     }
     case 'cve_scan':
       return fetchScan();

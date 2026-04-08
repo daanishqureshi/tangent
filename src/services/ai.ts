@@ -37,7 +37,8 @@ export type AgentToolCall =
   | { name: 'put_secret';     input: { name: string; value: string; description?: string } }
   | { name: 'inject_secret';  input: { repo: string; secret_name: string } }
   | { name: 'remember_person'; input: { user_id: string; name: string; note: string } }
-  | { name: 'read_file';      input: { repo: string; path: string } };
+  | { name: 'read_file';      input: { repo: string; path: string; ref?: string } }
+  | { name: 'list_commits';   input: { repo: string; path?: string; limit?: number } };
 
 export type AgentResponse =
   | { type: 'tool'; call: AgentToolCall }
@@ -259,6 +260,7 @@ const TOOLS: Anthropic.Tool[] = [
     name: 'read_file',
     description:
       'Read the raw contents of any file in a GitHub repository by path. ' +
+      'Optionally pass a commit SHA (ref) to read the file as it existed at that commit — use this to recover deleted or overwritten files from git history. ' +
       'Use when you need to see the actual code in a specific file before editing it — for example main.py, app.py, src/index.ts, etc. ' +
       'After reading a file you can modify it and push it back with push_file. ' +
       'Do NOT use inspect_repo when you need a specific file — inspect_repo only returns top-level metadata. Use read_file for any actual source file.',
@@ -267,8 +269,27 @@ const TOOLS: Anthropic.Tool[] = [
       properties: {
         repo: { type: 'string', description: 'Repository name, e.g. "asana-hubspot-webhook"' },
         path: { type: 'string', description: 'File path within the repo, e.g. "main.py" or "src/services/app.ts"' },
+        ref:  { type: 'string', description: 'Optional commit SHA or branch to read the file at. Omit for current HEAD.' },
       },
       required: ['repo', 'path'],
+    },
+  },
+  {
+    name: 'list_commits',
+    description:
+      'List recent commits for a GitHub repository, optionally filtered to a specific file. ' +
+      'Returns commit SHA, message, author, and date. ' +
+      'Use when you need to find a previous version of a file (e.g. before it was accidentally deleted or overwritten), ' +
+      'or when the user asks to see the commit history. ' +
+      'After finding the right commit SHA, use read_file with that SHA as the ref to recover the old file contents.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        repo:  { type: 'string', description: 'Repository name, e.g. "asana-hubspot-webhook"' },
+        path:  { type: 'string', description: 'Optional: filter commits to those that touched this file path, e.g. "main.py"' },
+        limit: { type: 'number', description: 'Max number of commits to return (default 20)' },
+      },
+      required: ['repo'],
     },
   },
   {
@@ -333,6 +354,7 @@ Your primary superpower is DevOps: deploy services, monitor them, tear them down
 - CRITICAL — repo names: NEVER invent or guess a repo name. Only use names the user has explicitly stated or ones returned by list_repos. If unsure, call list_repos first.
 - push_file: ZERO approval needed, ever. When asked to add/push/commit a file, call push_file IMMEDIATELY. Do NOT say "I'll write it now" as text — just call the tool. If you inspected a repo and now need to push a file, call push_file right away in the same turn. Never describe what you're about to push — just push it.
 - read_file → push_file: When asked to edit a specific file in a repo, ALWAYS read_file first to get the current contents, then push_file with the modified version. Do NOT ask the user to paste the file — you can read it yourself. Chain immediately: read_file → (process) → push_file.
+- Recovering deleted files: Use list_commits with the file path to find the last commit that touched it, then read_file with that commit SHA as ref to recover the old content, then push_file to restore it.
 
 *Port rules — critical, read carefully:*
 - The port MUST match what the app actually listens on inside the container. Getting this wrong causes "Cannot GET /" or connection refused.
@@ -569,6 +591,13 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
       return { name: 'read_file', input: {
         repo: String(raw['repo'] ?? ''),
         path: String(raw['path'] ?? ''),
+        ref:  raw['ref'] ? String(raw['ref']) : undefined,
+      }};
+    case 'list_commits':
+      return { name: 'list_commits', input: {
+        repo:  String(raw['repo'] ?? ''),
+        path:  raw['path']  ? String(raw['path'])  : undefined,
+        limit: raw['limit'] ? Number(raw['limit'])  : 20,
       }};
     case 'put_secret':
       return { name: 'put_secret', input: {
