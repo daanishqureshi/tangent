@@ -52,6 +52,7 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
     taskCpu,
     taskMemory,
     ecsExecutionRoleArn,
+    ecsTaskRoleArn,
     fargate,
     defaultAppPort,
   } = config();
@@ -164,6 +165,7 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
     cpu: taskCpu,
     memory: taskMemory,
     executionRoleArn: ecsExecutionRoleArn,
+    taskRoleArn: ecsTaskRoleArn,
   });
 
   const registerResult = await ecsClient().send(registerCmd);

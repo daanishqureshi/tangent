@@ -48,6 +48,7 @@ export interface Config {
 
   // IAM
   ecsExecutionRoleArn: string;
+  ecsTaskRoleArn: string; // role the running container uses to call AWS APIs (boto3, sdk, etc.)
 
   // Secrets (populated at startup from Secrets Manager)
   ngrokAuthtoken: string;
@@ -160,6 +161,9 @@ export async function loadConfig(): Promise<Config> {
   const ecrRepoName = optionalEnv('ECR_REPO_NAME', 'local-dev');
   const logGroupName = optionalEnv('LOG_GROUP_NAME', '/ecs/local-dev');
   const ecsExecutionRoleArn = optionalEnv('ECS_EXECUTION_ROLE_ARN', 'arn:aws:iam::000000000000:role/local-dev');
+  // Task role = what the running container uses to call AWS (boto3, SDK, etc.)
+  // Defaults to execution role if not separately configured.
+  const ecsTaskRoleArn = optionalEnv('ECS_TASK_ROLE_ARN', ecsExecutionRoleArn);
   const fargateSubs = optionalEnv('FARGATE_SUBNETS', 'subnet-local').split(',').map((s) => s.trim());
   const fargateSg = optionalEnv('FARGATE_SECURITY_GROUP', 'sg-local');
   const slackChannel = optionalEnv('SLACK_CHANNEL', '#local-dev');
@@ -245,6 +249,7 @@ export async function loadConfig(): Promise<Config> {
       assignPublicIp,
     },
     ecsExecutionRoleArn,
+    ecsTaskRoleArn,
     ngrokAuthtoken,
     githubToken,
     anthropicApiKey,

@@ -536,6 +536,9 @@ async function executeToolCall(
     case 'put_secret':
       await handlePutSecret(ctx, call.input as { name: string; value: string; description?: string }, convKey);
       break;
+    case 'inject_secret':
+      await handleInjectSecret(ctx, call.input as { repo: string; secret_name: string }, convKey);
+      break;
     case 'remember_person':
       await handleRememberPerson(call.input as { user_id: string; name: string; note: string });
       break;
@@ -1212,6 +1215,94 @@ async function fetchDiscover(): Promise<string> {
   parts.push(`\nConfirmed: ECS_CLUSTER_NAME=${cfg.ecsClusterName}, GITHUB_ORG=${cfg.githubOrg}`);
 
   return parts.join('\n');
+}
+
+async function handleInjectSecret(
+  ctx: Ctx,
+  input: { repo: string; secret_name: string },
+  convKey: string,
+): Promise<void> {
+  if (ctx.userId !== APPROVER_ID) {
+    await post(ctx.client, ctx.channel, ctx.threadTs, '🔒 Only Daanish can inject secrets into services.');
+    return;
+  }
+
+  const { repo, secret_name } = input;
+  const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Wiring \`${secret_name}\` into \`${repo}\`...`);
+
+  try {
+    const { DescribeSecretCommand, ListSecretsCommand: _LS } = await import('@aws-sdk/client-secrets-manager');
+    const {
+      RegisterTaskDefinitionCommand,
+      UpdateServiceCommand,
+      ListTaskDefinitionsCommand,
+      DescribeTaskDefinitionCommand,
+    } = await import('@aws-sdk/client-ecs');
+    const { smClient } = await import('./aws.js');
+    const { ecsClient } = await import('./aws.js');
+    const { SERVICE_PREFIX, TASK_FAMILY_PREFIX } = await import('../utils/constants.js');
+
+    // 1. Resolve the secret ARN from Secrets Manager
+    const secretMeta = await smClient().send(new DescribeSecretCommand({ SecretId: secret_name }));
+    const secretArn = secretMeta.ARN;
+    if (!secretArn) throw new Error(`Secret "${secret_name}" not found in Secrets Manager`);
+
+    // 2. Fetch the current task definition
+    const taskFamily = `${TASK_FAMILY_PREFIX}${repo}`;
+    const listResult = await ecsClient().send(new ListTaskDefinitionsCommand({
+      familyPrefix: taskFamily,
+      sort: 'DESC',
+      maxResults: 1,
+      status: 'ACTIVE',
+    }));
+    const latestArn = listResult.taskDefinitionArns?.[0];
+    if (!latestArn) throw new Error(`No active task definition found for "${repo}"`);
+
+    const descResult = await ecsClient().send(new DescribeTaskDefinitionCommand({ taskDefinition: latestArn }));
+    const taskDef = descResult.taskDefinition;
+    if (!taskDef) throw new Error('Could not describe task definition');
+
+    const containers = taskDef.containerDefinitions ?? [];
+    const appContainer = containers.find((c) => c.name === 'app');
+    if (!appContainer) throw new Error('No "app" container found in task definition');
+
+    // 3. Add/update the secret in the app container (dedupe by name)
+    const existingSecrets = appContainer.secrets ?? [];
+    const filtered = existingSecrets.filter((s) => s.name !== secret_name);
+    appContainer.secrets = [...filtered, { name: secret_name, valueFrom: secretArn }];
+
+    // 4. Re-register the task definition with the new secret
+    const registerResult = await ecsClient().send(new RegisterTaskDefinitionCommand({
+      family:                   taskDef.family,
+      containerDefinitions:     containers,
+      networkMode:              taskDef.networkMode,
+      requiresCompatibilities:  taskDef.requiresCompatibilities,
+      cpu:                      taskDef.cpu,
+      memory:                   taskDef.memory,
+      executionRoleArn:         taskDef.executionRoleArn,
+      taskRoleArn:              taskDef.taskRoleArn ?? config().ecsTaskRoleArn,
+      volumes:                  taskDef.volumes,
+    }));
+    const newTaskDefArn = registerResult.taskDefinition?.taskDefinitionArn;
+    if (!newTaskDefArn) throw new Error('Task definition re-registration returned no ARN');
+
+    // 5. Force a new deployment so the running container picks up the secret
+    const { ecsClusterName } = config();
+    await ecsClient().send(new UpdateServiceCommand({
+      cluster:            ecsClusterName,
+      service:            `${SERVICE_PREFIX}${repo}`,
+      taskDefinition:     newTaskDefArn,
+      forceNewDeployment: true,
+    }));
+
+    const msg = `✅ \`${secret_name}\` is now wired into \`${repo}\` as an env var. New deployment triggered — the container will restart with the secret available as \`os.environ["${secret_name}"]\`.`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+  } catch (err) {
+    const msg = `❌ Failed to inject secret: ${err instanceof Error ? err.message : String(err)}`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+  }
 }
 
 async function fetchListSecrets(): Promise<string> {

@@ -35,6 +35,7 @@ export type AgentToolCall =
   | { name: 'allow_user';    input: { user_id: string; display_name: string } }
   | { name: 'list_secrets';    input: Record<string, never> }
   | { name: 'put_secret';     input: { name: string; value: string; description?: string } }
+  | { name: 'inject_secret';  input: { repo: string; secret_name: string } }
   | { name: 'remember_person'; input: { user_id: string; name: string; note: string } };
 
 export type AgentResponse =
@@ -191,6 +192,24 @@ const TOOLS: Anthropic.Tool[] = [
         display_name: { type: 'string', description: 'Display name of the user, for the confirmation message' },
       },
       required: ['user_id', 'display_name'],
+    },
+  },
+  {
+    name: 'inject_secret',
+    description:
+      'Wire a secret from AWS Secrets Manager as an environment variable into a deployed ECS service. ' +
+      'Only Daanish (U07EU7KSG3U) can do this. ' +
+      'Use when someone says "inject X into repo Y", "wire secret X to service Y", "add env var X from secrets manager to Y", ' +
+      'or when a service is crashing because it cannot find a secret/env var. ' +
+      'This re-registers the task definition with the secret injected and force-deploys the service — no code change needed. ' +
+      'repo is the repository/service name. secret_name is the exact secret name in Secrets Manager (e.g. "ASANA_PAT").',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        repo:        { type: 'string', description: 'Repository/service name, e.g. "asana-hubspot-webhook"' },
+        secret_name: { type: 'string', description: 'Exact secret name in Secrets Manager, e.g. "ASANA_PAT"' },
+      },
+      required: ['repo', 'secret_name'],
     },
   },
   {
@@ -512,6 +531,11 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
       return { name: 'allow_user', input: {
         user_id:      String(raw['user_id']      ?? ''),
         display_name: String(raw['display_name'] ?? ''),
+      }};
+    case 'inject_secret':
+      return { name: 'inject_secret', input: {
+        repo:        String(raw['repo']        ?? ''),
+        secret_name: String(raw['secret_name'] ?? ''),
       }};
     case 'remember_person':
       return { name: 'remember_person', input: {
