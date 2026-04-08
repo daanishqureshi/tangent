@@ -9,6 +9,8 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   RegisterTaskDefinitionCommand,
   CreateServiceCommand,
@@ -35,6 +37,7 @@ export interface DeployInput {
   imageUri: string;
   port?: number;
   env?: Record<string, string>;
+  freshUrl?: boolean; // force a new ngrok URL even if one already exists
 }
 
 export interface DeployOutput {
@@ -64,15 +67,12 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
   const serviceName = `${SERVICE_PREFIX}${repo}`;
   const taskFamily = `${TASK_FAMILY_PREFIX}${repo}`;
 
-  // ─── Generate a random ngrok URL for this deploy ─────────────────────────
-  // On paid ngrok plans, any subdomain of ngrok.app works without pre-registering.
-  // We generate it here so we know the URL before the container starts.
+  // ─── Resolve ngrok URL for this deploy ───────────────────────────────────
+  // Reuse the URL from a previous deploy if one exists, so the endpoint stays
+  // stable across redeployments. Pass freshUrl=true to generate a new one.
+  const ngrokUrl = resolveNgrokUrl(repo, input.freshUrl ?? false);
 
-  const suffix = randomBytes(4).toString('hex'); // 8 random hex chars
-  const slug = `tangent-${repo.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 20)}-${suffix}`;
-  const ngrokUrl = `https://${slug}.ngrok.app`;
-
-  logger.info({ action: 'deploy:ngrok_url', ngrokUrl }, 'Generated ngrok URL');
+  logger.info({ action: 'deploy:ngrok_url', ngrokUrl, fresh: input.freshUrl ?? false }, 'Resolved ngrok URL');
 
   // ─── Ensure CloudWatch log group exists ──────────────────────────────────
 
@@ -269,6 +269,45 @@ async function fetchExistingAppSecrets(taskFamily: string): Promise<Secret[]> {
   } catch {
     return []; // no previous revision or API error — start fresh
   }
+}
+
+// ─── Ngrok URL registry ───────────────────────────────────────────────────────
+
+const NGROK_URLS_FILE = resolve(process.cwd(), 'config/ngrok-urls.json');
+
+function loadNgrokUrls(): Record<string, string> {
+  try {
+    return JSON.parse(readFileSync(NGROK_URLS_FILE, 'utf8')) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+function saveNgrokUrl(repo: string, url: string): void {
+  try {
+    const urls = loadNgrokUrls();
+    urls[repo] = url;
+    writeFileSync(NGROK_URLS_FILE, JSON.stringify(urls, null, 2));
+  } catch (err) {
+    logger.warn({ action: 'deploy:ngrok_url_save_failed', err }, 'Could not persist ngrok URL');
+  }
+}
+
+function resolveNgrokUrl(repo: string, fresh: boolean): string {
+  const urls = loadNgrokUrls();
+  if (!fresh && urls[repo]) {
+    return urls[repo]!;
+  }
+  const suffix = randomBytes(4).toString('hex');
+  const slug = `tangent-${repo.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 20)}-${suffix}`;
+  const url = `https://${slug}.ngrok.app`;
+  saveNgrokUrl(repo, url);
+  return url;
+}
+
+/** Return the stored ngrok URL for a repo, or null if never deployed. */
+export function getStoredNgrokUrl(repo: string): string | null {
+  return loadNgrokUrls()[repo] ?? null;
 }
 
 async function checkServiceExists(cluster: string, serviceName: string): Promise<boolean> {

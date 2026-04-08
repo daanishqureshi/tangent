@@ -417,7 +417,7 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
 
   // Deploy and teardown require explicit confirmation before executing
   if (call.name === 'deploy') {
-    const { repo, branch, port } = call.input as { repo: string; branch: string; port: number };
+    const { repo, branch, port, freshUrl } = call.input as { repo: string; branch: string; port: number; freshUrl?: boolean };
 
     // ── Validate repo exists in GitHub before showing confirmation ─────────
     let allRepos: { name: string }[];
@@ -438,12 +438,22 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
       return;
     }
 
+    // Show the URL that will be used — reused or fresh — so user knows upfront
+    const { getStoredNgrokUrl } = await import('../skills/deploy.js');
+    const existingUrl = getStoredNgrokUrl(repo);
+    const urlNote = freshUrl
+      ? `• URL: _new URL will be generated_`
+      : existingUrl
+        ? `• URL: ${existingUrl} _(same as last deploy)_`
+        : `• URL: _new URL will be generated_`;
+
     const requester = ctx.userId ? `<@${ctx.userId}>` : 'Someone';
     const prompt = [
       `🚀 *Deploy requested for \`${repo}\`*`,
       `• Requested by: ${requester}`,
       `• Branch: \`${branch}\``,
       `• Port: ${port}`,
+      urlNote,
       `• Cluster: \`tangent\` (us-east-1)`,
       '',
       `<@${APPROVER_ID}> — reply *yes* to approve or *no* to cancel.`,
@@ -514,7 +524,7 @@ async function executeToolCall(
   switch (call.name) {
     case 'deploy':
       _appendTurn(convKey, { role: 'assistant', content: `Deploying \`${(call.input as { repo: string }).repo}\`` });
-      await handleDeploy(ctx, call.input as { repo: string; branch: string; port: number }, convKey);
+      await handleDeploy(ctx, call.input as { repo: string; branch: string; port: number; freshUrl?: boolean }, convKey);
       break;
     case 'teardown':
       _appendTurn(convKey, { role: 'assistant', content: `Stopping \`${(call.input as { repo: string }).repo}\`` });
@@ -817,7 +827,7 @@ async function quickHealthCheck(
 
 async function handleDeploy(
   { channel, threadTs, userId, client }: Ctx,
-  { repo, branch, port }: { repo: string; branch: string; port: number },
+  { repo, branch, port, freshUrl }: { repo: string; branch: string; port: number; freshUrl?: boolean },
   convKey: string,
 ): Promise<void> {
   const actor = userId ? `<@${userId}>` : 'someone';
@@ -850,7 +860,7 @@ async function handleDeploy(
   let deployedAt: number;
   let ngrokUrl: string;
   try {
-    ({ deployedAt, ngrokUrl } = await deploySkill({ repo, imageUri, port }));
+    ({ deployedAt, ngrokUrl } = await deploySkill({ repo, imageUri, port, freshUrl }));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await update(client, channel, ts, `❌ ECS deploy failed`, errorBlocks('❌ ECS deploy failed', repo, msg));

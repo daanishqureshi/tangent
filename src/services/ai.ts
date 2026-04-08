@@ -21,7 +21,7 @@ export interface ConversationTurn {
 }
 
 export type AgentToolCall =
-  | { name: 'deploy';          input: { repo: string; branch: string; port: number } }
+  | { name: 'deploy';          input: { repo: string; branch: string; port: number; freshUrl?: boolean } }
   | { name: 'teardown';        input: { repo: string } }
   | { name: 'status';          input: { repo: string } }
   | { name: 'list_services';   input: Record<string, never> }
@@ -71,9 +71,10 @@ const TOOLS: Anthropic.Tool[] = [
     input_schema: {
       type: 'object' as const,
       properties: {
-        repo:   { type: 'string', description: 'Repository name, lowercase with hyphens, e.g. "my-cool-tool"' },
-        branch: { type: 'string', description: 'Git branch to build from. Default: "main"' },
-        port:   { type: 'number', description: 'Port the app listens on inside the container. Default: 8080' },
+        repo:     { type: 'string', description: 'Repository name, lowercase with hyphens, e.g. "my-cool-tool"' },
+        branch:   { type: 'string', description: 'Git branch to build from. Default: "main"' },
+        port:     { type: 'number', description: 'Port the app listens on inside the container. Default: 8080' },
+        freshUrl: { type: 'boolean', description: 'Set true to generate a brand-new ngrok URL instead of reusing the existing one. Only use when the user explicitly asks for a new URL.' },
       },
       required: ['repo'],
     },
@@ -496,9 +497,10 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
       return {
         name: 'deploy',
         input: {
-          repo:   String(raw['repo'] ?? ''),
-          branch: String(raw['branch'] ?? 'main'),
-          port:   Number(raw['port'] ?? 8080),
+          repo:     String(raw['repo'] ?? ''),
+          branch:   String(raw['branch'] ?? 'main'),
+          port:     Number(raw['port'] ?? 8080),
+          freshUrl: raw['freshUrl'] === true,
         },
       };
     case 'teardown':
