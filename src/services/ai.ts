@@ -38,7 +38,8 @@ export type AgentToolCall =
   | { name: 'inject_secret';  input: { repo: string; secret_name: string } }
   | { name: 'remember_person'; input: { user_id: string; name: string; note: string } }
   | { name: 'read_file';      input: { repo: string; path: string; ref?: string } }
-  | { name: 'list_commits';   input: { repo: string; path?: string; limit?: number } };
+  | { name: 'list_commits';   input: { repo: string; path?: string; limit?: number } }
+  | { name: 'restore_file';  input: { repo: string; path: string; ref: string; message?: string } };
 
 export type AgentResponse =
   | { type: 'tool'; call: AgentToolCall }
@@ -281,7 +282,7 @@ const TOOLS: Anthropic.Tool[] = [
       'Returns commit SHA, message, author, and date. ' +
       'Use when you need to find a previous version of a file (e.g. before it was accidentally deleted or overwritten), ' +
       'or when the user asks to see the commit history. ' +
-      'After finding the right commit SHA, use read_file with that SHA as the ref to recover the old file contents.',
+      'After finding the right commit SHA, use restore_file (NOT read_file + push_file) to recover it — restore_file does the copy server-side so no content is lost.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -290,6 +291,24 @@ const TOOLS: Anthropic.Tool[] = [
         limit: { type: 'number', description: 'Max number of commits to return (default 20)' },
       },
       required: ['repo'],
+    },
+  },
+  {
+    name: 'restore_file',
+    description:
+      'Restore a file in a GitHub repo to its contents at a specific previous commit. ' +
+      'Does the read + write entirely server-side — content never passes through the LLM context, so nothing can be lost or truncated. ' +
+      'Use this (not read_file + push_file) whenever recovering a file from git history. ' +
+      'Workflow: list_commits to find the SHA of the last good version → restore_file with that SHA.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        repo:    { type: 'string', description: 'Repository name, e.g. "asana-hubspot-webhook"' },
+        path:    { type: 'string', description: 'File path to restore, e.g. "main.py"' },
+        ref:     { type: 'string', description: 'Commit SHA of the version to restore, e.g. "abc1234"' },
+        message: { type: 'string', description: 'Commit message. Defaults to "restore: <path> from <ref>"' },
+      },
+      required: ['repo', 'path', 'ref'],
     },
   },
   {
@@ -354,7 +373,7 @@ Your primary superpower is DevOps: deploy services, monitor them, tear them down
 - CRITICAL — repo names: NEVER invent or guess a repo name. Only use names the user has explicitly stated or ones returned by list_repos. If unsure, call list_repos first.
 - push_file: ZERO approval needed, ever. When asked to add/push/commit a file, call push_file IMMEDIATELY. Do NOT say "I'll write it now" as text — just call the tool. If you inspected a repo and now need to push a file, call push_file right away in the same turn. Never describe what you're about to push — just push it.
 - read_file → push_file: When asked to edit a specific file in a repo, ALWAYS read_file first to get the current contents, then push_file with the modified version. Do NOT ask the user to paste the file — you can read it yourself. Chain immediately: read_file → (process) → push_file.
-- Recovering deleted files: Use list_commits with the file path to find the last commit that touched it, then read_file with that commit SHA as ref to recover the old content, then push_file to restore it.
+- Recovering deleted/overwritten files: Use list_commits with the file path to find the last good commit SHA, then call restore_file with that SHA. NEVER use read_file + push_file for recovery — content gets lost through the LLM context window. restore_file does it atomically server-side.
 
 *Port rules — critical, read carefully:*
 - The port MUST match what the app actually listens on inside the container. Getting this wrong causes "Cannot GET /" or connection refused.
@@ -598,6 +617,13 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
         repo:  String(raw['repo'] ?? ''),
         path:  raw['path']  ? String(raw['path'])  : undefined,
         limit: raw['limit'] ? Number(raw['limit'])  : 20,
+      }};
+    case 'restore_file':
+      return { name: 'restore_file', input: {
+        repo:    String(raw['repo']    ?? ''),
+        path:    String(raw['path']    ?? ''),
+        ref:     String(raw['ref']     ?? ''),
+        message: raw['message'] ? String(raw['message']) : undefined,
       }};
     case 'put_secret':
       return { name: 'put_secret', input: {

@@ -564,6 +564,9 @@ async function executeToolCall(
     case 'push_file':
       await handlePushFile(ctx, call.input as { repo: string; path: string; content: string; message?: string; branch?: string }, convKey);
       break;
+    case 'restore_file':
+      await handleRestoreFile(ctx, call.input as { repo: string; path: string; ref: string; message?: string }, convKey);
+      break;
     case 'allow_user': {
       const { user_id, display_name } = call.input as { user_id: string; display_name: string };
       if (ctx.userId !== 'U07EU7KSG3U') {
@@ -668,6 +671,45 @@ async function handlePushFile(
   } catch (err) {
     clearInterval(loadingInterval);
     const msg = `❌ Failed to push \`${filePath}\`: ${err instanceof Error ? err.message : String(err)}`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+  }
+}
+
+/**
+ * Restore a file to a previous commit's contents — server-side, no LLM round-trip.
+ * Content is read from GitHub at the given ref and pushed directly back to HEAD.
+ */
+async function handleRestoreFile(
+  ctx: Ctx,
+  input: { repo: string; path: string; ref: string; message?: string },
+  convKey: string,
+): Promise<void> {
+  const { repo, path: filePath, ref, message } = input;
+  const commitMessage = message ?? `restore: ${filePath} from ${ref.slice(0, 7)}`;
+
+  const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Restoring \`${filePath}\` in \`${repo}\` from commit \`${ref.slice(0, 7)}\`...`);
+
+  try {
+    // Read content at the historical commit server-side
+    const content = await readRepoFile(repo, filePath, ref);
+    if (content === null) {
+      const msg = `❌ Could not find \`${filePath}\` at commit \`${ref.slice(0, 7)}\` in \`${repo}\`.`;
+      await update(ctx.client, ctx.channel, ts, msg);
+      _appendTurn(convKey, { role: 'assistant', content: msg });
+      return;
+    }
+
+    // Push it directly — no LLM involved, content is intact
+    const { sha, url } = await pushFile(repo, filePath, content, commitMessage);
+    const short = sha.slice(0, 7);
+    const msg = url
+      ? `✅ Restored \`${filePath}\` in \`${repo}\` from \`${ref.slice(0, 7)}\` → commit \`${short}\`\n${url}`
+      : `✅ Restored \`${filePath}\` in \`${repo}\` from \`${ref.slice(0, 7)}\` → commit \`${short}\``;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+  } catch (err) {
+    const msg = `❌ Restore failed: ${err instanceof Error ? err.message : String(err)}`;
     await update(ctx.client, ctx.channel, ts, msg);
     _appendTurn(convKey, { role: 'assistant', content: msg });
   }
