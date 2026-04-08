@@ -32,6 +32,7 @@ export type AgentToolCall =
   | { name: 'logs';            input: { repo: string; container?: string } }
   | { name: 'clear_logs';     input: { repo: string; container?: string } }
   | { name: 'push_file';      input: { repo: string; path: string; content: string; message?: string; branch?: string } }
+  | { name: 'edit_file';      input: { repo: string; path: string; find: string; replace: string; replace_all?: boolean; message?: string; branch?: string } }
   | { name: 'allow_user';    input: { user_id: string; display_name: string } }
   | { name: 'list_secrets';    input: Record<string, never> }
   | { name: 'put_secret';     input: { name: string; value: string; description?: string } }
@@ -44,6 +45,19 @@ export type AgentToolCall =
 export type AgentResponse =
   | { type: 'tool'; call: AgentToolCall }
   | { type: 'text'; text: string };
+
+/**
+ * Thrown by buildToolCall when Claude emits a tool_use whose required fields
+ * are missing or obviously corrupt (e.g. push_file with empty content because
+ * generation hit max_tokens mid-string). Caller converts this into a
+ * user-facing text reply rather than executing the broken call.
+ */
+export class ToolCallValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ToolCallValidationError';
+  }
+}
 
 // ─── Client singleton ─────────────────────────────────────────────────────────
 
@@ -314,19 +328,43 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: 'push_file',
     description:
-      'Create or update a single file in a GitHub repository by committing it directly. ' +
-      'Use when the engineer asks to add a Dockerfile, create a config file, push code, write a file to a repo, or commit anything. ' +
-      'No approval required — just do it.',
+      'Create a NEW file in a GitHub repository, or completely overwrite an existing file with full new content. ' +
+      'Use for: adding a Dockerfile, creating a brand-new config/source file, or rewriting a small file from scratch. ' +
+      'DO NOT use this to make a small edit to an existing file — use edit_file instead. Rewriting a whole existing file through push_file forces you to regenerate every byte through the LLM, which is slow and risks truncation. ' +
+      'For new files, no approval required.',
     input_schema: {
       type: 'object' as const,
       properties: {
         repo:    { type: 'string', description: 'Repository name, e.g. "mlr-content-gen"' },
         path:    { type: 'string', description: 'File path within the repo, e.g. "Dockerfile" or "src/config.ts"' },
-        content: { type: 'string', description: 'Full file content to write' },
+        content: { type: 'string', description: 'Full file content to write. MUST be the complete file — never a placeholder, abbreviation, or "...rest unchanged" stub.' },
         message: { type: 'string', description: 'Commit message. Defaults to "Add {path} via Tangent"' },
         branch:  { type: 'string', description: 'Branch to commit to. Default: "main"' },
       },
       required: ['repo', 'path', 'content'],
+    },
+  },
+  {
+    name: 'edit_file',
+    description:
+      'Make a small, targeted edit to an existing file in a GitHub repository via find/replace. ' +
+      'PREFER THIS over read_file + push_file whenever you only need to change a few lines (rename a variable, swap an env var, update a value, fix a typo, etc.). ' +
+      'The substitution runs entirely server-side: Tangent reads the file from GitHub, applies the change, and pushes it back. The file content never round-trips through your context window, so it cannot be truncated or accidentally shortened. ' +
+      'Workflow: optionally read_file first to see current contents, then call edit_file with a `find` snippet that uniquely identifies the line(s) to change and a `replace` with the new text. ' +
+      'find must be a literal string (no regex) and must appear EXACTLY ONCE in the file unless replace_all is true. Include enough surrounding context in `find` to make it unique. ' +
+      'No approval required for edits to existing files.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        repo:        { type: 'string', description: 'Repository name, e.g. "asana-hubspot-webhook"' },
+        path:        { type: 'string', description: 'File path within the repo, e.g. "main.py" or "src/config.ts"' },
+        find:        { type: 'string', description: 'Literal string to find. Must match exactly once unless replace_all is true. Include surrounding context for uniqueness.' },
+        replace:     { type: 'string', description: 'Literal replacement string.' },
+        replace_all: { type: 'boolean', description: 'When true, replace every occurrence of `find`. Default: false (requires unique match).' },
+        message:     { type: 'string', description: 'Commit message. Defaults to "Edit {path} via Tangent".' },
+        branch:      { type: 'string', description: 'Branch to commit to. Default: "main".' },
+      },
+      required: ['repo', 'path', 'find', 'replace'],
     },
   },
 ];
@@ -371,8 +409,8 @@ Your primary superpower is DevOps: deploy services, monitor them, tear them down
 - Conversational messages → reply conversationally. Don't force tool calls to look busy.
 - ALWAYS check conversation history before responding.
 - CRITICAL — repo names: NEVER invent or guess a repo name. Only use names the user has explicitly stated or ones returned by list_repos. If unsure, call list_repos first.
-- push_file: ZERO approval needed, ever. When asked to add/push/commit a file, call push_file IMMEDIATELY. Do NOT say "I'll write it now" as text — just call the tool. If you inspected a repo and now need to push a file, call push_file right away in the same turn. Never describe what you're about to push — just push it.
-- read_file → push_file: When asked to edit a specific file in a repo, ALWAYS read_file first to get the current contents, then push_file with the modified version. Do NOT ask the user to paste the file — you can read it yourself. Chain immediately: read_file → (process) → push_file.
+- push_file: use ONLY for creating brand-new files or rewriting trivially small files. ZERO approval needed for new files. When asked to add a Dockerfile / config / new source file, call push_file IMMEDIATELY — don't narrate, just call it. NEVER use push_file to make a small change to an existing larger file: regenerating an entire file through the LLM risks truncation, "rest unchanged" placeholders, or accidentally emptying the file. Use edit_file instead.
+- edit_file: use for ALL small, targeted edits to existing files (renaming a variable, fixing an env var name, swapping a port, updating a constant, fixing a typo, replacing a couple of lines). The substitution runs server-side — file content never passes through your context, so nothing can be lost. Workflow: optionally read_file to see what's there, then edit_file with a unique \`find\` snippet and the new \`replace\` text. Always prefer this over read_file + push_file for edits.
 - Recovering deleted/overwritten files: Use list_commits with the file path to find the last good commit SHA, then call restore_file with that SHA. NEVER use read_file + push_file for recovery — content gets lost through the LLM context window. restore_file does it atomically server-side.
 
 *Port rules — critical, read carefully:*
@@ -525,6 +563,16 @@ export async function processMessage(
     // If Claude called a tool, extract and normalize it
     const toolBlock = response.content.find((b) => b.type === 'tool_use');
     if (toolBlock && toolBlock.type === 'tool_use') {
+      // If generation was cut off mid-tool-use, the input JSON is incomplete —
+      // refuse to execute and tell the user.
+      if (response.stop_reason === 'max_tokens') {
+        logger.warn(
+          { action: 'ai:tool_call:truncated', tool: toolBlock.name },
+          'Tool call hit max_tokens — refusing to execute partial call',
+        );
+        return { type: 'text', text: `I started preparing a \`${toolBlock.name}\` call but ran out of generation room mid-way, so I'm not going to send it — a partial tool call could do the wrong thing. Try breaking the request into a smaller change (e.g. use \`edit_file\` for a targeted edit instead of rewriting a whole file).` };
+      }
+
       const raw = toolBlock.input as Record<string, unknown>;
 
       // Normalize repo name to lowercase-hyphen format
@@ -534,8 +582,16 @@ export async function processMessage(
 
       logger.info({ action: 'ai:tool_call', tool: toolBlock.name, input: raw }, 'Tool called');
 
-      const call = buildToolCall(toolBlock.name, raw);
-      if (call) return { type: 'tool', call };
+      try {
+        const call = buildToolCall(toolBlock.name, raw);
+        if (call) return { type: 'tool', call };
+      } catch (err) {
+        if (err instanceof ToolCallValidationError) {
+          logger.warn({ action: 'ai:tool_call:validation', tool: toolBlock.name, msg: err.message }, 'Refused malformed tool call');
+          return { type: 'text', text: `⚠️ ${err.message}` };
+        }
+        throw err;
+      }
     }
 
     // Claude replied with text (general answer, follow-up, greeting, clarification, etc.)
@@ -580,14 +636,58 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
       return { name: 'logs', input: { repo: String(raw['repo'] ?? ''), container: raw['container'] ? String(raw['container']) : 'ngrok' } };
     case 'clear_logs':
       return { name: 'clear_logs', input: { repo: String(raw['repo'] ?? ''), container: raw['container'] ? String(raw['container']) : 'ngrok' } };
-    case 'push_file':
+    case 'push_file': {
+      // Validate strictly. An empty/missing `content` here almost always means
+      // generation got truncated mid-string by max_tokens — emitting the call
+      // anyway would land an empty file on main (the asana-hubspot-webhook bug).
+      const repo = String(raw['repo'] ?? '');
+      const path = String(raw['path'] ?? '');
+      const rawContent = raw['content'];
+      if (!repo || !path) {
+        throw new ToolCallValidationError(`push_file is missing required fields (repo / path).`);
+      }
+      if (typeof rawContent !== 'string') {
+        throw new ToolCallValidationError(
+          `push_file for \`${path}\` arrived with no \`content\` field — looks like generation was truncated. Refusing to push. Try edit_file for small changes, or ask me to retry.`,
+        );
+      }
+      if (rawContent.trim().length === 0) {
+        throw new ToolCallValidationError(
+          `push_file for \`${path}\` arrived with empty content — refusing to commit an empty file. If you really meant to truncate \`${path}\`, say so explicitly. Otherwise use edit_file for targeted changes.`,
+        );
+      }
       return { name: 'push_file', input: {
-        repo:    String(raw['repo']    ?? ''),
-        path:    String(raw['path']    ?? ''),
-        content: String(raw['content'] ?? ''),
+        repo,
+        path,
+        content: rawContent,
         message: raw['message'] ? String(raw['message']) : undefined,
         branch:  raw['branch']  ? String(raw['branch'])  : 'main',
       }};
+    }
+    case 'edit_file': {
+      const repo    = String(raw['repo'] ?? '');
+      const path    = String(raw['path'] ?? '');
+      const find    = raw['find'];
+      const replace = raw['replace'];
+      if (!repo || !path) {
+        throw new ToolCallValidationError(`edit_file is missing required fields (repo / path).`);
+      }
+      if (typeof find !== 'string' || find.length === 0) {
+        throw new ToolCallValidationError(`edit_file for \`${path}\` is missing the \`find\` string.`);
+      }
+      if (typeof replace !== 'string') {
+        throw new ToolCallValidationError(`edit_file for \`${path}\` is missing the \`replace\` string.`);
+      }
+      return { name: 'edit_file', input: {
+        repo,
+        path,
+        find,
+        replace,
+        replace_all: raw['replace_all'] === true,
+        message: raw['message'] ? String(raw['message']) : undefined,
+        branch:  raw['branch']  ? String(raw['branch'])  : 'main',
+      }};
+    }
     case 'allow_user':
       return { name: 'allow_user', input: {
         user_id:      String(raw['user_id']      ?? ''),
@@ -743,7 +843,7 @@ export async function continueAfterTool(
 
     const response = await withRetry(() => client().messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 2048,
+      max_tokens: 8192,
       system: buildSystemPrompt(),
       tools: TOOLS,
       messages,
@@ -752,10 +852,32 @@ export async function continueAfterTool(
     // Claude may respond with a tool call (next action) or text (done)
     const toolUseBlock = response.content.find((b) => b.type === 'tool_use');
     if (toolUseBlock?.type === 'tool_use') {
-      const nextCall = buildToolCall(toolUseBlock.name, toolUseBlock.input as Record<string, unknown>);
-      if (nextCall) {
-        logger.info({ action: 'ai:continue_after_tool:tool_call', next: nextCall.name }, 'Claude chaining to next tool');
-        return { type: 'tool', call: nextCall };
+      // Truncated chained tool call → refuse. This is the exact failure mode that
+      // produced the empty-main.py incident: a chained push_file got cut off
+      // mid-content and was executed with an empty string.
+      if (response.stop_reason === 'max_tokens') {
+        logger.warn(
+          { action: 'ai:continue_after_tool:truncated', tool: toolUseBlock.name },
+          'Chained tool call hit max_tokens — refusing partial execution',
+        );
+        return {
+          type: 'text',
+          text: `I started chaining a \`${toolUseBlock.name}\` after \`${call.name}\` but ran out of room before finishing, so I won't send it — a half-formed call could overwrite a file with the wrong contents. If you wanted a small change to an existing file, use \`edit_file\` (it's a find/replace that runs server-side).`,
+        };
+      }
+
+      try {
+        const nextCall = buildToolCall(toolUseBlock.name, toolUseBlock.input as Record<string, unknown>);
+        if (nextCall) {
+          logger.info({ action: 'ai:continue_after_tool:tool_call', next: nextCall.name }, 'Claude chaining to next tool');
+          return { type: 'tool', call: nextCall };
+        }
+      } catch (err) {
+        if (err instanceof ToolCallValidationError) {
+          logger.warn({ action: 'ai:continue_after_tool:validation', tool: toolUseBlock.name, msg: err.message }, 'Refused malformed chained tool call');
+          return { type: 'text', text: `⚠️ ${err.message}` };
+        }
+        throw err;
       }
     }
 

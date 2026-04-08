@@ -241,6 +241,69 @@ export async function pushFile(
 }
 
 /**
+ * Edit a file in a GitHub repo by find/replace — entirely server-side.
+ * Reads the file via Octokit, runs the substitution locally, pushes back via pushFile.
+ * Content never round-trips through the LLM context window, so it cannot be truncated.
+ *
+ * - find: literal string to match (NOT a regex). Must be unique unless replaceAll is true.
+ * - replace: literal replacement string.
+ * - replaceAll: when true, replaces every occurrence; otherwise requires exactly one match.
+ *
+ * Throws if the file doesn't exist, find has no match, or find matches multiple times
+ * without replaceAll.
+ */
+export async function editFile(
+  repo: string,
+  filePath: string,
+  find: string,
+  replace: string,
+  options: { replaceAll?: boolean; commitMessage?: string; branch?: string } = {},
+): Promise<{ sha: string; url: string; matches: number; oldSize: number; newSize: number }> {
+  const { branch = 'main', replaceAll = false } = options;
+
+  if (!find) throw new Error('edit_file: `find` cannot be empty');
+
+  const original = await readRepoFile(repo, filePath, branch);
+  if (original === null) {
+    throw new Error(`File not found: \`${filePath}\` in \`${repo}\` (${branch}). Use push_file to create it.`);
+  }
+
+  const firstIdx = original.indexOf(find);
+  if (firstIdx === -1) {
+    throw new Error(`No match for the \`find\` string in \`${filePath}\`. The file content may differ from what you expected — re-read it.`);
+  }
+
+  let updated: string;
+  let matches: number;
+  if (replaceAll) {
+    const parts = original.split(find);
+    matches = parts.length - 1;
+    updated = parts.join(replace);
+  } else {
+    const secondIdx = original.indexOf(find, firstIdx + find.length);
+    if (secondIdx !== -1) {
+      throw new Error(`The \`find\` string matches more than once in \`${filePath}\` — include more surrounding context to make it unique, or pass replace_all: true.`);
+    }
+    matches = 1;
+    updated = original.slice(0, firstIdx) + replace + original.slice(firstIdx + find.length);
+  }
+
+  if (updated === original) {
+    throw new Error(`edit_file: replacement produced no change in \`${filePath}\` — find and replace are identical.`);
+  }
+
+  const commitMessage = options.commitMessage ?? `Edit ${filePath} via Tangent`;
+  const { sha, url } = await pushFile(repo, filePath, updated, commitMessage, branch);
+
+  logger.info(
+    { action: 'github:edit_file', repo, filePath, matches, oldSize: original.length, newSize: updated.length, sha },
+    'File edited',
+  );
+
+  return { sha, url, matches, oldSize: original.length, newSize: updated.length };
+}
+
+/**
  * Read a single file from a repo by path, optionally at a specific commit SHA or branch.
  * Returns the decoded UTF-8 content, or null if the file doesn't exist or isn't readable.
  */

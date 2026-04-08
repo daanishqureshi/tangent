@@ -27,7 +27,7 @@ import { tunnelSkill, TunnelTimeoutError } from '../skills/tunnel.js';
 import { teardownSkill } from '../skills/teardown.js';
 import { scanSkill } from '../skills/scan.js';
 import { discoverSkill } from '../skills/discover.js';
-import { listAllRepos, inspectRepo, pushFile, readRepoFile, listCommits } from './github.js';
+import { listAllRepos, inspectRepo, pushFile, readRepoFile, listCommits, editFile } from './github.js';
 import { logger } from '../utils/logger.js';
 
 // ─── App singleton ────────────────────────────────────────────────────────────
@@ -473,34 +473,8 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
   }
 
   if (call.name === 'push_file') {
-    const { repo, path: filePath, content, branch = 'main', message } = call.input as {
-      repo: string; path: string; content: string; branch?: string; message?: string;
-    };
-
-    // Check if file already exists — new files go through immediately, updates need confirmation
-    const existingContent = await readRepoFile(repo, filePath, branch).catch(() => null);
-    if (existingContent !== null) {
-      // File exists — show a preview and require Daanish to confirm before overwriting
-      const preview = content.length > 400 ? content.slice(0, 400) + '\n...(truncated)' : content;
-      const commitMsg = message ?? `Update ${filePath} via Tangent`;
-      const prompt = [
-        `✏️ *Push to existing file \`${filePath}\` in \`${repo}\`*`,
-        `• Branch: \`${branch}\``,
-        `• Commit message: _${commitMsg}_`,
-        '',
-        '*New content preview:*',
-        '```',
-        preview,
-        '```',
-        '',
-        `<@${APPROVER_ID}> — reply *yes* to push or *no* to cancel.`,
-      ].join('\n');
-      _setPending(convKey, call, prompt, APPROVER_ID, ctx.userId);
-      await post(ctx.client, ctx.channel, ctx.threadTs, prompt);
-      _appendTurn(convKey, { role: 'assistant', content: prompt });
-      return;
-    }
-    // New file — no confirmation needed, fall through to executeToolCall
+    const result = await gatePushFile(call, ctx, convKey);
+    if (result !== 'pass') return;
   }
 
   if (call.name === 'teardown') {
@@ -563,6 +537,9 @@ async function executeToolCall(
       break;
     case 'push_file':
       await handlePushFile(ctx, call.input as { repo: string; path: string; content: string; message?: string; branch?: string }, convKey);
+      break;
+    case 'edit_file':
+      await handleEditFile(ctx, call.input as { repo: string; path: string; find: string; replace: string; replace_all?: boolean; message?: string; branch?: string }, convKey);
       break;
     case 'restore_file':
       await handleRestoreFile(ctx, call.input as { repo: string; path: string; ref: string; message?: string }, convKey);
@@ -636,6 +613,14 @@ async function handleInfoTool(
   await update(ctx.client, ctx.channel, ts, `✓ ${call.name} done`);
   _appendTurn(convKey, { role: 'assistant', content: `Ran ${call.name}, continuing...` });
 
+  // Run any sanity gates that route() would have run for the chained call.
+  // Critical: without this, a chained read_file → push_file bypassed the
+  // existing-file confirmation prompt and could land an empty file on main.
+  if (next.call.name === 'push_file') {
+    const gateResult = await gatePushFile(next.call, ctx, convKey);
+    if (gateResult !== 'pass') return;
+  }
+
   const updatedHistory: ConversationTurn[] = [
     ...history,
     { role: 'user',      content: userMessage },
@@ -646,6 +631,90 @@ async function handleInfoTool(
   void executeToolCall(next.call, ctx, convKey, userMessage, updatedHistory);
 }
 
+/**
+ * Sanity-check + (if needed) confirmation gate for push_file calls.
+ *
+ * Called by BOTH the route() entry path AND the chain path in handleInfoTool,
+ * so a chained read_file → push_file is subject to the same guards as a
+ * direct push_file. The bug that landed an empty main.py on
+ * asana-hubspot-webhook escaped because the chain path used to call
+ * executeToolCall directly, bypassing the inline gate that route() had.
+ *
+ * Returns:
+ *   'pass'     — caller should proceed to executeToolCall(call)
+ *   'gated'    — a confirmation prompt was posted; caller should bail
+ *   'rejected' — content failed a hard sanity check; caller should bail
+ */
+async function gatePushFile(
+  call: AgentToolCall & { name: 'push_file' },
+  ctx: Ctx,
+  convKey: string,
+): Promise<'pass' | 'gated' | 'rejected'> {
+  const { repo, path: filePath, content, branch = 'main', message } = call.input;
+
+  // Hard sanity: refuse empty / whitespace-only / suspiciously tiny pushes.
+  // 20 bytes is below any plausible real source file or Dockerfile and is
+  // the size we'd see if generation truncated the content string.
+  if (!content || content.trim().length === 0) {
+    const msg = `🛑 Refusing to push an empty \`${filePath}\` to \`${repo}\`. If you really meant to truncate the file, say so explicitly. Otherwise use \`edit_file\` for targeted changes.`;
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return 'rejected';
+  }
+  if (content.length < 20) {
+    const msg = `🛑 Refusing to push \`${filePath}\` — only ${content.length} bytes, which looks truncated. Use \`edit_file\` for small changes, or re-issue the request if you really meant to write that.`;
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return 'rejected';
+  }
+
+  // Check if the file already exists.
+  const existingContent = await readRepoFile(repo, filePath, branch).catch(() => null);
+
+  if (existingContent === null) {
+    // New file — no confirmation needed, just push.
+    return 'pass';
+  }
+
+  // Updating an existing file. If the new content is dramatically smaller than
+  // the old content, refuse outright — that's the empty-main.py shape and is
+  // almost never what was intended for an edit. The model should use edit_file.
+  const SHRINK_FLOOR = 0.25;
+  if (existingContent.length >= 200 && content.length < existingContent.length * SHRINK_FLOOR) {
+    const msg = [
+      `🛑 Refusing to overwrite \`${filePath}\` in \`${repo}\`.`,
+      `• Existing file: ${existingContent.length} bytes`,
+      `• New content: ${content.length} bytes (${Math.round((content.length / existingContent.length) * 100)}% of original)`,
+      ``,
+      `That's a major shrink — usually means the file got truncated mid-generation, not that you really meant to gut it. For a small change, use \`edit_file\` instead. If you genuinely want to rewrite this file from scratch, say so explicitly and I'll ask for confirmation.`,
+    ].join('\n');
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return 'rejected';
+  }
+
+  // Existing file, sane size — show a preview and require Daanish to confirm.
+  const preview = content.length > 400 ? content.slice(0, 400) + '\n...(truncated)' : content;
+  const commitMsg = message ?? `Update ${filePath} via Tangent`;
+  const prompt = [
+    `✏️ *Push to existing file \`${filePath}\` in \`${repo}\`*`,
+    `• Branch: \`${branch}\``,
+    `• Existing: ${existingContent.length} bytes → New: ${content.length} bytes`,
+    `• Commit message: _${commitMsg}_`,
+    '',
+    '*New content preview:*',
+    '```',
+    preview,
+    '```',
+    '',
+    `<@${APPROVER_ID}> — reply *yes* to push or *no* to cancel.`,
+  ].join('\n');
+  _setPending(convKey, call, prompt, APPROVER_ID, ctx.userId);
+  await post(ctx.client, ctx.channel, ctx.threadTs, prompt);
+  _appendTurn(convKey, { role: 'assistant', content: prompt });
+  return 'gated';
+}
+
 async function handlePushFile(
   ctx: Ctx,
   input: { repo: string; path: string; content: string; message?: string; branch?: string },
@@ -653,6 +722,15 @@ async function handlePushFile(
 ): Promise<void> {
   const { repo, path: filePath, content, branch = 'main' } = input;
   const commitMessage = input.message ?? `Add ${filePath} via Tangent`;
+
+  // Final defense-in-depth check: if for any reason an empty content slipped
+  // through gatePushFile (e.g. a future caller forgets to gate), still refuse.
+  if (!content || content.trim().length === 0) {
+    const msg = `🛑 Refusing to push an empty \`${filePath}\` to \`${repo}\` (final guard).`;
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return;
+  }
 
   const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Pushing \`${filePath}\` to \`${repo}\`...`);
   const loadingInterval = setInterval(() => {
@@ -671,6 +749,42 @@ async function handlePushFile(
   } catch (err) {
     clearInterval(loadingInterval);
     const msg = `❌ Failed to push \`${filePath}\`: ${err instanceof Error ? err.message : String(err)}`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+  }
+}
+
+/**
+ * Server-side find/replace edit. Content never round-trips through the LLM
+ * context window — we read the file via Octokit, run the substitution locally,
+ * and push the result back. This is the safe path for any small edit and
+ * should be preferred over read_file + push_file.
+ */
+async function handleEditFile(
+  ctx: Ctx,
+  input: { repo: string; path: string; find: string; replace: string; replace_all?: boolean; message?: string; branch?: string },
+  convKey: string,
+): Promise<void> {
+  const { repo, path: filePath, find, replace, replace_all, message, branch = 'main' } = input;
+
+  const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Editing \`${filePath}\` in \`${repo}\`...`);
+
+  try {
+    const { sha, url, matches, oldSize, newSize } = await editFile(repo, filePath, find, replace, {
+      replaceAll: replace_all === true,
+      commitMessage: message,
+      branch,
+    });
+    const short = sha.slice(0, 7);
+    const matchesNote = matches > 1 ? ` (${matches} matches replaced)` : '';
+    const sizeNote = ` ${oldSize}B → ${newSize}B`;
+    const msg = url
+      ? `✅ Edited \`${filePath}\` in \`${repo}\` (${branch}) — commit \`${short}\`${matchesNote}${sizeNote}\n${url}`
+      : `✅ Edited \`${filePath}\` in \`${repo}\` (${branch}) — commit \`${short}\`${matchesNote}${sizeNote}`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+  } catch (err) {
+    const msg = `❌ Edit failed: ${err instanceof Error ? err.message : String(err)}`;
     await update(ctx.client, ctx.channel, ts, msg);
     _appendTurn(convKey, { role: 'assistant', content: msg });
   }
