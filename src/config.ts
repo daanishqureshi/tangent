@@ -129,11 +129,18 @@ export function allowUser(userId: string): AllowUserResult {
     existing.push(userId);
     writeFileSync(ALLOWED_USERS_FILE, JSON.stringify({ allowedUserIds: existing }, null, 2));
 
+    // Push to whatever branch is currently checked out — the EC2 host was
+    // historically on `master` while local dev uses `main`, and hardcoding
+    // `main` here meant the push silently no-op'd on EC2, leaving runtime
+    // commits stranded locally until the next manual `git pull` diverged.
+    const currentBranch = execSync(`git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD`, { stdio: ['pipe', 'pipe', 'pipe'] })
+      .toString().trim();
+
     execSync(
       `git -C "${PROJECT_ROOT}" add config/allowed_users.json && ` +
       `git -C "${PROJECT_ROOT}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
       `commit -m "chore: allow user ${userId}" && ` +
-      `git -C "${PROJECT_ROOT}" push origin main`,
+      `git -C "${PROJECT_ROOT}" push origin ${currentBranch}`,
       { stdio: 'pipe' },
     );
 

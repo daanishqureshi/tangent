@@ -5,3 +5,5 @@ dist/
 *.pem
 mcp/node_modules/
 mcp/dist/
+# Runtime-written, not source of truth — see skills/deploy.ts
+config/ngrok-urls.json
