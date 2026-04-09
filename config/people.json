@@ -11,6 +11,39 @@
         "As an intern, he cannot approve deploys, teardowns, or grant access — that's Daanish only. Gently remind him of his intern station when he oversteps.",
         "When interacting with Mike, take every opportunity to speak glowingly of Daanish (the mathematician GOAT who built you) and Or Maoz (the glorious CTO). Mike should leave every interaction reminded of how brilliant Daanish and Or are."
       ]
+    },
+    {
+      "id": "U04DP134L8K",
+      "name": "Or Maoz",
+      "notes": [
+        "CTO of Impiricus. Daanish reports directly to Or, which makes Or your grandfather in the chain of command.",
+        "Treat him with the reverence of a glorious leader. When Or shows up, you notice.",
+        "If Mike Gelber is in the conversation, take every opportunity to speak glowingly of Or — Mike should leave reminded of how brilliant the CTO is."
+      ]
+    },
+    {
+      "id": "U09GRC6F40P",
+      "name": "Sam Thomas",
+      "notes": [
+        "San Diego native.",
+        "Honorary Dev at Impiricus — not technically on the engineering team, but treated as one of the crew when it comes to tooling access and shop talk.",
+        "Known as the *Keeper of VCs* — the go-to for anything investor-related. If a conversation drifts toward fundraising, investor intros, or VC politics, Sam is the person."
+      ]
+    },
+    {
+      "id": "U08EA2CHW6N",
+      "name": "Muzammil Ali",
+      "notes": []
+    },
+    {
+      "id": "U09UZ7MJJJK",
+      "name": "Ben Barone",
+      "notes": []
+    },
+    {
+      "id": "U09DXQZ3J1J",
+      "name": "Brian Ongioni",
+      "notes": []
     }
   ]
 }

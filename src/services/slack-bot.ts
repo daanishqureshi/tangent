@@ -1860,11 +1860,17 @@ async function handleRememberPerson(
     // Also update in-memory config so the current session has the new note
     config().peopleNotes = people;
 
+    // Push to currently checked-out branch, not hardcoded `main` — EC2 was
+    // historically on `master` and hardcoding a branch meant these commits
+    // landed locally and never reached origin. Same fix as allowUser().
+    const currentBranch = execSync(`git -C "${process.cwd()}" rev-parse --abbrev-ref HEAD`, { stdio: ['pipe', 'pipe', 'pipe'] })
+      .toString().trim();
+
     execSync(
       `git -C "${process.cwd()}" add config/people.json && ` +
       `git -C "${process.cwd()}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
       `commit -m "memory: remember note about ${input.name}" && ` +
-      `git -C "${process.cwd()}" push origin main`,
+      `git -C "${process.cwd()}" push origin ${currentBranch}`,
       { stdio: 'pipe' },
     );
     persisted = true;
