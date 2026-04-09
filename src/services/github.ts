@@ -197,6 +197,10 @@ export async function inspectRepo(repo: string): Promise<RepoInspection> {
 /**
  * Create or update a single file in a GitHub repo.
  * Uses the GitHub Contents API — no git clone required.
+ *
+ * The optional `owner` override lets callers target a repo outside the default
+ * Impiricus-AI org — primarily used by self-edit tools which push to Tangent's
+ * own repository (e.g. daanishqureshi/tangent).
  */
 export async function pushFile(
   repo: string,
@@ -204,14 +208,15 @@ export async function pushFile(
   content: string,
   commitMessage: string,
   branch = 'main',
+  owner?: string,
 ): Promise<{ sha: string; url: string }> {
-  const { githubOrg } = config();
+  const resolvedOwner = owner ?? config().githubOrg;
 
   // Check if the file already exists — if so we need its blob SHA to update it
   let existingSha: string | undefined;
   try {
     const { data } = await octokit().repos.getContent({
-      owner: githubOrg,
+      owner: resolvedOwner,
       repo,
       path: filePath,
       ref: branch,
@@ -224,7 +229,7 @@ export async function pushFile(
   }
 
   const { data } = await octokit().repos.createOrUpdateFileContents({
-    owner: githubOrg,
+    owner: resolvedOwner,
     repo,
     path: filePath,
     message: commitMessage,
@@ -236,7 +241,7 @@ export async function pushFile(
   const commitSha = data.commit.sha ?? '';
   const fileUrl   = data.content?.html_url ?? '';
 
-  logger.info({ action: 'github:push_file', repo, filePath, commitSha }, 'File pushed');
+  logger.info({ action: 'github:push_file', owner: resolvedOwner, repo, filePath, commitSha }, 'File pushed');
   return { sha: commitSha, url: fileUrl };
 }
 
@@ -257,13 +262,13 @@ export async function editFile(
   filePath: string,
   find: string,
   replace: string,
-  options: { replaceAll?: boolean; commitMessage?: string; branch?: string } = {},
+  options: { replaceAll?: boolean; commitMessage?: string; branch?: string; owner?: string } = {},
 ): Promise<{ sha: string; url: string; matches: number; oldSize: number; newSize: number }> {
-  const { branch = 'main', replaceAll = false } = options;
+  const { branch = 'main', replaceAll = false, owner } = options;
 
   if (!find) throw new Error('edit_file: `find` cannot be empty');
 
-  const original = await readRepoFile(repo, filePath, branch);
+  const original = await readRepoFile(repo, filePath, branch, owner);
   if (original === null) {
     throw new Error(`File not found: \`${filePath}\` in \`${repo}\` (${branch}). Use push_file to create it.`);
   }
@@ -293,7 +298,7 @@ export async function editFile(
   }
 
   const commitMessage = options.commitMessage ?? `Edit ${filePath} via Tangent`;
-  const { sha, url } = await pushFile(repo, filePath, updated, commitMessage, branch);
+  const { sha, url } = await pushFile(repo, filePath, updated, commitMessage, branch, owner);
 
   logger.info(
     { action: 'github:edit_file', repo, filePath, matches, oldSize: original.length, newSize: updated.length, sha },
@@ -306,11 +311,17 @@ export async function editFile(
 /**
  * Read a single file from a repo by path, optionally at a specific commit SHA or branch.
  * Returns the decoded UTF-8 content, or null if the file doesn't exist or isn't readable.
+ * `owner` override lets self-edit tools read from Tangent's own repo.
  */
-export async function readRepoFile(repo: string, filePath: string, ref?: string): Promise<string | null> {
-  const { githubOrg } = config();
+export async function readRepoFile(
+  repo: string,
+  filePath: string,
+  ref?: string,
+  owner?: string,
+): Promise<string | null> {
+  const resolvedOwner = owner ?? config().githubOrg;
   try {
-    const res = await octokit().repos.getContent({ owner: githubOrg, repo, path: filePath, ...(ref ? { ref } : {}) });
+    const res = await octokit().repos.getContent({ owner: resolvedOwner, repo, path: filePath, ...(ref ? { ref } : {}) });
     const file = res.data as { type: string; content?: string; encoding?: string };
     if (file.type !== 'file' || !file.content) return null;
     return Buffer.from(file.content, (file.encoding as BufferEncoding) ?? 'base64').toString('utf-8');
@@ -329,11 +340,12 @@ export interface CommitInfo {
 
 /**
  * List recent commits for a repo, optionally filtered to a specific file path.
+ * `owner` override lets self-edit tools target Tangent's own repo.
  */
-export async function listCommits(repo: string, filePath?: string, limit = 20): Promise<CommitInfo[]> {
-  const { githubOrg } = config();
+export async function listCommits(repo: string, filePath?: string, limit = 20, owner?: string): Promise<CommitInfo[]> {
+  const resolvedOwner = owner ?? config().githubOrg;
   const { data } = await octokit().repos.listCommits({
-    owner: githubOrg,
+    owner: resolvedOwner,
     repo,
     per_page: limit,
     ...(filePath ? { path: filePath } : {}),

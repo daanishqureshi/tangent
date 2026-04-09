@@ -66,6 +66,13 @@ export interface Config {
   githubOrg: string;
   scaffoldChildTopic: string;
 
+  // Self-editing: the owner/repo of Tangent's own source repository.
+  // Populated from TANGENT_SELF_OWNER / TANGENT_SELF_REPO env vars.
+  // Used by the Daanish-only self_* tools so Tangent can modify its own
+  // codebase from a DM conversation.
+  selfOwner: string;
+  selfRepo: string;
+
   // Server
   port: number;
   host: string;
@@ -86,33 +93,62 @@ export function config(): Config {
   return _config;
 }
 
-/** Dynamically add a Slack user ID to the allowed list at runtime, and persist to GitHub. */
-export function allowUser(userId: string): void {
-  config().allowedSlackUserIds.add(userId);
+export interface AllowUserResult {
+  /** True iff the user was already in memory (idempotent re-add). */
+  alreadyAllowed: boolean;
+  /** True iff a commit was created and pushed to GitHub. */
+  persisted: boolean;
+  /** Short SHA of the new commit, when persisted. */
+  commitSha?: string;
+  /** Error message if the disk write or git push failed. In-memory grant still succeeded. */
+  error?: string;
+}
 
-  // Persist to config/allowed_users.json and push to GitHub so it survives redeploys
+/**
+ * Dynamically add a Slack user ID to the allowed list at runtime, and persist to GitHub.
+ * Returns a structured result so callers can surface *what actually happened* (in-memory
+ * grant vs. persisted commit vs. push failure) back to the user instead of a blind
+ * "done". Without this, Tangent reports success even when the git push silently fails.
+ */
+export function allowUser(userId: string): AllowUserResult {
+  const cfg = config();
+  const alreadyAllowed = cfg.allowedSlackUserIds.has(userId);
+  cfg.allowedSlackUserIds.add(userId);
+
+  let existing: string[] = [];
   try {
-    let existing: string[] = [];
+    existing = (JSON.parse(readFileSync(ALLOWED_USERS_FILE, 'utf8')) as { allowedUserIds: string[] }).allowedUserIds;
+  } catch { /* file missing or malformed — start fresh */ }
+
+  if (existing.includes(userId)) {
+    // Nothing to persist — already on disk from a prior run.
+    return { alreadyAllowed, persisted: false };
+  }
+
+  try {
+    existing.push(userId);
+    writeFileSync(ALLOWED_USERS_FILE, JSON.stringify({ allowedUserIds: existing }, null, 2));
+
+    execSync(
+      `git -C "${PROJECT_ROOT}" add config/allowed_users.json && ` +
+      `git -C "${PROJECT_ROOT}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
+      `commit -m "chore: allow user ${userId}" && ` +
+      `git -C "${PROJECT_ROOT}" push origin main`,
+      { stdio: 'pipe' },
+    );
+
+    let commitSha: string | undefined;
     try {
-      existing = (JSON.parse(readFileSync(ALLOWED_USERS_FILE, 'utf8')) as { allowedUserIds: string[] }).allowedUserIds;
-    } catch { /* file missing or malformed — start fresh */ }
+      commitSha = execSync(`git -C "${PROJECT_ROOT}" rev-parse --short HEAD`, { stdio: ['pipe', 'pipe', 'pipe'] })
+        .toString().trim();
+    } catch { /* best-effort */ }
 
-    if (!existing.includes(userId)) {
-      existing.push(userId);
-      writeFileSync(ALLOWED_USERS_FILE, JSON.stringify({ allowedUserIds: existing }, null, 2));
-
-      execSync(
-        `git -C "${PROJECT_ROOT}" add config/allowed_users.json && ` +
-        `git -C "${PROJECT_ROOT}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
-        `commit -m "chore: allow user ${userId}" && ` +
-        `git -C "${PROJECT_ROOT}" push origin main`,
-        { stdio: 'pipe' },
-      );
-      logger.info({ action: 'config:allow_user:persisted', userId }, 'Allowed user persisted to GitHub');
-    }
+    logger.info({ action: 'config:allow_user:persisted', userId, commitSha }, 'Allowed user persisted to GitHub');
+    return { alreadyAllowed, persisted: true, commitSha };
   } catch (err) {
-    // Never let persistence failure break the in-memory grant
-    logger.warn({ action: 'config:allow_user:persist_failed', userId, err }, 'Failed to persist allowed user to GitHub');
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.warn({ action: 'config:allow_user:persist_failed', userId, err: errMsg }, 'Failed to persist allowed user to GitHub');
+    return { alreadyAllowed, persisted: false, error: errMsg };
   }
 }
 
@@ -188,6 +224,10 @@ export async function loadConfig(): Promise<Config> {
   const githubOrg = optionalEnv('GITHUB_ORG', 'impiricus');
   const scaffoldChildTopic = optionalEnv('SCAFFOLD_CHILD_TOPIC', 'impiricus-scaffold-child');
   const workspaceDir = optionalEnv('WORKSPACE_DIR', '/tmp/tangent-workspace');
+  // Self-edit target — the owner/repo of Tangent's own source tree.
+  // Defaults match the current dev repo so LOCAL_DEV doesn't need these set.
+  const selfOwner = optionalEnv('TANGENT_SELF_OWNER', 'daanishqureshi');
+  const selfRepo  = optionalEnv('TANGENT_SELF_REPO',  'tangent');
 
   const port = parseInt(optionalEnv('PORT', '3000'), 10);
   const host = optionalEnv('HOST', '127.0.0.1');
@@ -260,6 +300,8 @@ export async function loadConfig(): Promise<Config> {
     peopleNotes,
     githubOrg,
     scaffoldChildTopic,
+    selfOwner,
+    selfRepo,
     port,
     host,
     workspaceDir,

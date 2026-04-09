@@ -34,6 +34,39 @@ import { logger } from '../utils/logger.js';
 
 let _app: App | null = null;
 
+/**
+ * Tangent's own Slack member ID, captured at startup via auth.test().
+ * Used to distinguish its own `<@BOT_ID>` mentions (which should be stripped
+ * from user text) from mentions of OTHER users (which must be preserved so
+ * Claude can use them as tool input — e.g. `allow_user`).
+ */
+let _botUserId: string | null = null;
+
+/**
+ * Strip Tangent's own @mention from a user message, but preserve every other
+ * `<@USERID>` mention verbatim. This is critical: the old implementation
+ * regex-stripped *every* `<@USERID>` token, which meant when Daanish said
+ * "add @Sam Thomas", Sam's Slack ID was deleted before Claude ever saw it,
+ * and Claude had to invent a user_id for `allow_user` — picking the most
+ * recent ID from earlier thread context (e.g. Brian Ongioni).
+ *
+ * We keep foreign mentions as raw `<@USERID>` tokens so:
+ *   - Claude can read them as identifiers
+ *   - the system prompt can teach it "body-mention ID = tool user_id"
+ *   - replies that include the same token render as proper Slack mentions
+ */
+function sanitizeSlackText(text: string): string {
+  if (!text) return text;
+  // Strip Tangent's own mention (and any leftover whitespace from the strip).
+  // Fallback: if bot ID isn't loaded yet, strip NO mentions — it's safer to
+  // leave an extra "@Tangent" in the text than to lose a target user's ID.
+  if (_botUserId) {
+    const botMention = new RegExp(`<@${_botUserId}>`, 'g');
+    text = text.replace(botMention, '');
+  }
+  return text.replace(/\s+/g, ' ').trim();
+}
+
 // ─── Access control ───────────────────────────────────────────────────────────
 
 /** The channel where all deploy/teardown notifications and approvals live. */
@@ -184,7 +217,8 @@ async function buildHistory(
       if (msg.ts === currentMessageTs) continue; // skip current message
       if (msg.subtype) continue;                 // skip join/leave etc.
       const isBot = !!msg.bot_id;
-      const text = (msg.text ?? '').replace(/<@[A-Z0-9]+>/g, '').trim();
+      // Preserve foreign mentions (target users), strip only Tangent's own.
+      const text = sanitizeSlackText(msg.text ?? '');
       if (!text) continue;
       if (isBot) {
         turns.push({ role: 'assistant', content: text });
@@ -247,8 +281,10 @@ export function initSlackBot(): void {
       ? mcpMatch[1]
       : (typeof event.user === 'string' ? event.user : undefined);
 
-    // Strip both the MCP prefix and the @mention from the text Claude sees
-    const text = rawText.replace(/^\[MCP-USER:\s*[A-Z0-9]+\]\s*/, '').replace(/<@[A-Z0-9]+>/g, '').trim();
+    // Strip the MCP prefix and Tangent's own @mention, but preserve any
+    // *other* user mentions in the body — they're targets Claude may need
+    // (e.g. "add @Sam" must keep Sam's <@USERID> intact).
+    const text = sanitizeSlackText(rawText.replace(/^\[MCP-USER:\s*[A-Z0-9]+\]\s*/, ''));
     if (!text) return;
     await route({ channel, threadTs, userId, client, text, source: 'mention', messageTs });
   });
@@ -263,7 +299,10 @@ export function initSlackBot(): void {
     const channel   = 'channel' in event ? String(event.channel) : '';
     const messageTs = 'ts' in event ? String(event.ts) : '';
     const userId    = 'user' in event && typeof event.user === 'string' ? event.user : undefined;
-    const text      = ('text' in event && typeof event.text === 'string') ? event.text.trim() : '';
+    const rawMsgText = ('text' in event && typeof event.text === 'string') ? event.text : '';
+    // Strip Tangent's own mention if present (thread replies may @mention it
+    // again), preserve every other user mention as a potential target ID.
+    const text = sanitizeSlackText(rawMsgText);
     const threadTs  = ('thread_ts' in event && event.thread_ts) ? String(event.thread_ts) : '';
 
     if (!text || !channel || !messageTs) return;
@@ -290,6 +329,24 @@ export function initSlackBot(): void {
 export async function startSlackBot(): Promise<void> {
   if (!_app) return;
   await _app.start();
+
+  // Resolve Tangent's own Slack member ID so sanitizeSlackText() can strip
+  // `<@BOT_ID>` self-mentions without touching other users' mentions. If this
+  // fails, sanitizeSlackText() falls back to preserving all mentions — that's
+  // safe (Claude will just see an extra "@Tangent" token) and far better
+  // than the old behaviour of stripping every mention including targets.
+  try {
+    const auth = await _app.client.auth.test();
+    if (typeof auth.user_id === 'string' && auth.user_id) {
+      _botUserId = auth.user_id;
+      logger.info({ action: 'slack_bot:bot_id', botUserId: _botUserId }, 'Resolved Tangent bot user ID');
+    } else {
+      logger.warn({ action: 'slack_bot:bot_id_missing' }, 'auth.test() returned no user_id — foreign mention preservation still works, self-mention strip disabled');
+    }
+  } catch (err) {
+    logger.warn({ action: 'slack_bot:bot_id_failed', err }, 'Failed to resolve bot user ID');
+  }
+
   logger.info({ action: 'slack_bot:started' }, 'Slack bot connected via Socket Mode');
 }
 
@@ -342,7 +399,10 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
   }
 
   // ── Daanish-only: dynamically add a user to the allowed list ──────────────
-  // Usage (DM or mention): "add @username" / "allow @username"
+  // Usage (DM or mention): "add @username" / "allow @username".
+  // This is a fast path that bypasses Claude routing entirely — valuable
+  // because it cannot pick the wrong ID. It now works again post-sanitize
+  // since foreign `<@USERID>` mentions are preserved in the text.
   const addUserMatch = /^(?:add|allow)\s+<@([A-Z0-9]+)>/i.exec(text.trim());
   if (addUserMatch) {
     if (resolvedUserId !== 'U07EU7KSG3U') {
@@ -350,8 +410,19 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
       return;
     }
     const newUserId = addUserMatch[1]!;
-    allowUser(newUserId);
-    await post(ctx.client, ctx.channel, ctx.threadTs, `✅ <@${newUserId}> has been added to the allowed list.`);
+    const result = allowUser(newUserId);
+    let msg: string;
+    if (result.alreadyAllowed && !result.persisted && !result.error) {
+      msg = `ℹ️ <@${newUserId}> is already on the allowed list.`;
+    } else if (result.persisted) {
+      const shaNote = result.commitSha ? ` (commit \`${result.commitSha}\`)` : '';
+      msg = `✅ <@${newUserId}> has been added — pushed to \`main\`${shaNote}.`;
+    } else if (result.error) {
+      msg = `⚠️ <@${newUserId}> granted in memory, but GitHub push failed: _${result.error}_`;
+    } else {
+      msg = `✅ <@${newUserId}> has been added to the allowed list.`;
+    }
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
     return;
   }
 
@@ -533,7 +604,7 @@ async function executeToolCall(
       break;
     case 'teardown':
       _appendTurn(convKey, { role: 'assistant', content: `Stopping \`${(call.input as { repo: string }).repo}\`` });
-      await handleTeardown(ctx, call.input as { repo: string });
+      await handleTeardown(ctx, call.input as { repo: string }, convKey);
       break;
     case 'push_file':
       await handlePushFile(ctx, call.input as { repo: string; path: string; content: string; message?: string; branch?: string }, convKey);
@@ -547,11 +618,25 @@ async function executeToolCall(
     case 'allow_user': {
       const { user_id, display_name } = call.input as { user_id: string; display_name: string };
       if (ctx.userId !== 'U07EU7KSG3U') {
-        await post(ctx.client, ctx.channel, ctx.threadTs, '🔒 Only Daanish can grant access to Tangent.');
+        const msg = '🔒 Only Daanish can grant access to Tangent.';
+        await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+        _appendTurn(convKey, { role: 'assistant', content: msg });
         break;
       }
-      allowUser(user_id);
-      await post(ctx.client, ctx.channel, ctx.threadTs, `✅ Done — <@${user_id}> (${display_name}) now has access to Tangent.`);
+      const result = allowUser(user_id);
+      let msg: string;
+      if (result.alreadyAllowed && !result.persisted && !result.error) {
+        msg = `ℹ️ <@${user_id}> (${display_name}) is already on the allowed list — no change needed.`;
+      } else if (result.persisted) {
+        const shaNote = result.commitSha ? ` (commit \`${result.commitSha}\`)` : '';
+        msg = `✅ Done — <@${user_id}> (${display_name}) now has access to Tangent. Persisted to \`config/allowed_users.json\` and pushed to \`main\`${shaNote}.`;
+      } else if (result.error) {
+        msg = `⚠️ <@${user_id}> (${display_name}) granted access in memory, but I could NOT push the change to GitHub: _${result.error}_\nIt will be lost on next restart unless the push is redone manually.`;
+      } else {
+        msg = `✅ Done — <@${user_id}> (${display_name}) now has access to Tangent (already on disk).`;
+      }
+      await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+      _appendTurn(convKey, { role: 'assistant', content: msg });
       break;
     }
     case 'put_secret':
@@ -561,7 +646,20 @@ async function executeToolCall(
       await handleInjectSecret(ctx, call.input as { repo: string; secret_name: string }, convKey);
       break;
     case 'remember_person':
-      await handleRememberPerson(call.input as { user_id: string; name: string; note: string });
+      await handleRememberPerson(ctx, call.input as { user_id: string; name: string; note: string }, convKey);
+      break;
+    case 'read_self':
+    case 'list_self_commits':
+      if (!ensureSelfEditAllowed(ctx, convKey)) break;
+      await handleInfoTool(call, ctx, convKey, userMessage, history);
+      break;
+    case 'edit_self':
+      if (!ensureSelfEditAllowed(ctx, convKey)) break;
+      await handleSelfEdit(ctx, call.input as { path: string; find: string; replace: string; replace_all?: boolean; message?: string }, convKey);
+      break;
+    case 'push_self':
+      if (!ensureSelfEditAllowed(ctx, convKey)) break;
+      await handleSelfPush(ctx, call.input as { path: string; content: string; message?: string }, convKey);
       break;
     default:
       // Informational tools: fetch data, synthesize a conversational response via Claude
@@ -830,6 +928,121 @@ async function handleRestoreFile(
 }
 
 /**
+ * Gate for the self-edit tools (read_self / list_self_commits / edit_self / push_self).
+ *
+ * Two hard requirements:
+ *   1. Caller must be Daanish (APPROVER_ID). Nobody else can touch Tangent's source.
+ *   2. The conversation must be a DM with Tangent. Slack DM channel IDs start
+ *      with 'D' — channels are 'C', group DMs are 'G'. Restricting to DMs keeps
+ *      self-edits private and prevents anyone in a shared channel from watching
+ *      (or replying to a confirmation prompt for) a Tangent source-code change.
+ *
+ * Posts the refusal reason + records it in convKey history, so Claude sees
+ * the rejection on follow-up turns instead of silently re-trying.
+ * Returns true iff the caller passed both checks.
+ */
+function ensureSelfEditAllowed(ctx: Ctx, convKey: string): boolean {
+  if (ctx.userId !== APPROVER_ID) {
+    const msg = '🔒 Only Daanish can edit my source code. This is a hard gate.';
+    void post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return false;
+  }
+  if (!ctx.channel.startsWith('D')) {
+    const msg = '🔒 Self-edits only work in DMs with me — not in shared channels. DM me directly and we can do it there.';
+    void post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return false;
+  }
+  return true;
+}
+
+async function handleSelfEdit(
+  ctx: Ctx,
+  input: { path: string; find: string; replace: string; replace_all?: boolean; message?: string },
+  convKey: string,
+): Promise<void> {
+  const { path: filePath, find, replace, replace_all, message } = input;
+  const { selfOwner, selfRepo } = config();
+
+  const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Editing my own \`${filePath}\`...`);
+
+  try {
+    const { sha, url, matches, oldSize, newSize } = await editFile(selfRepo, filePath, find, replace, {
+      replaceAll: replace_all === true,
+      commitMessage: message ?? `self-edit: ${filePath}`,
+      owner: selfOwner,
+    });
+    const short = sha.slice(0, 7);
+    const matchesNote = matches > 1 ? ` (${matches} matches replaced)` : '';
+    const sizeNote = ` ${oldSize}B → ${newSize}B`;
+    const msg = [
+      url
+        ? `✅ Edited my own \`${filePath}\` — commit \`${short}\`${matchesNote}${sizeNote}\n${url}`
+        : `✅ Edited my own \`${filePath}\` — commit \`${short}\`${matchesNote}${sizeNote}`,
+      '',
+      `_Reminder: the change is on \`main\` but this running process is still on the old code. Pull + rebuild + \`pm2 restart tangent\` on EC2 to pick it up._`,
+    ].join('\n');
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+  } catch (err) {
+    const msg = `❌ Self-edit failed: ${err instanceof Error ? err.message : String(err)}`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+  }
+}
+
+async function handleSelfPush(
+  ctx: Ctx,
+  input: { path: string; content: string; message?: string },
+  convKey: string,
+): Promise<void> {
+  const { path: filePath, content } = input;
+  const { selfOwner, selfRepo } = config();
+
+  // Defense-in-depth: the ai.ts buildToolCall already rejects empty content,
+  // but duplicate the check here so the guarantee holds even if a future
+  // caller forgets to route through buildToolCall.
+  if (!content || content.trim().length === 0) {
+    const msg = `🛑 Refusing to push an empty \`${filePath}\` to Tangent source.`;
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return;
+  }
+
+  // Check if the file already exists in Tangent source — if so, this should
+  // have been an edit_self, not a push_self. Refuse and tell Daanish.
+  const existing = await readRepoFile(selfRepo, filePath, 'main', selfOwner).catch(() => null);
+  if (existing !== null) {
+    const msg = `🛑 \`${filePath}\` already exists in my source. Use \`edit_self\` for edits — rewriting a whole file risks truncation.`;
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return;
+  }
+
+  const commitMessage = input.message ?? `self-add: ${filePath}`;
+  const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Adding \`${filePath}\` to my source...`);
+
+  try {
+    const { sha, url } = await pushFile(selfRepo, filePath, content, commitMessage, 'main', selfOwner);
+    const short = sha.slice(0, 7);
+    const msg = [
+      url
+        ? `✅ Added \`${filePath}\` to my source — commit \`${short}\`\n${url}`
+        : `✅ Added \`${filePath}\` to my source — commit \`${short}\``,
+      '',
+      `_Reminder: pull + rebuild + \`pm2 restart tangent\` on EC2 to pick this up._`,
+    ].join('\n');
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+  } catch (err) {
+    const msg = `❌ Self-push failed: ${err instanceof Error ? err.message : String(err)}`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+  }
+}
+
+/**
  * Pure data-fetching — returns a raw string result for Claude to interpret.
  * No Slack posting here; that's the synthesizer's job.
  */
@@ -868,6 +1081,23 @@ async function fetchToolData(call: AgentToolCall): Promise<string> {
       return fetchClearLogs((call.input as { repo: string; container?: string }).repo, (call.input as { repo: string; container?: string }).container ?? 'ngrok');
     case 'list_secrets':
       return fetchListSecrets();
+    case 'read_self': {
+      const { path, ref } = call.input as { path: string; ref?: string };
+      const { selfOwner, selfRepo } = config();
+      const content = await readRepoFile(selfRepo, path, ref, selfOwner);
+      if (content === null) return `File not found in Tangent source: ${path}${ref ? ` at ref ${ref}` : ''}`;
+      const refNote = ref ? ` (at commit ${ref.slice(0, 7)})` : '';
+      return `Tangent source — ${path}${refNote}\n\`\`\`\n${content}\n\`\`\``;
+    }
+    case 'list_self_commits': {
+      const { path, limit } = call.input as { path?: string; limit?: number };
+      const { selfOwner, selfRepo } = config();
+      const commits = await listCommits(selfRepo, path, limit ?? 20, selfOwner);
+      if (commits.length === 0) return `No commits found in Tangent source${path ? ` for ${path}` : ''}`;
+      const lines = commits.map((c) => `\`${c.shortSha}\` ${c.date.slice(0, 10)} *${c.author}*: ${c.message}`);
+      const header = path ? `Tangent commits touching \`${path}\`:` : `Recent Tangent commits:`;
+      return `${header}\n${lines.join('\n')}`;
+    }
     default:
       return `Unknown tool: ${call.name}`;
   }
@@ -1050,6 +1280,7 @@ async function handleDeploy(
     else if (err instanceof DockerBuildError)   msg = `${err.summary}\n\`\`\`${err.raw.slice(0, 600)}\`\`\``;
     else                                        msg = err instanceof Error ? err.message : String(err);
     await update(client, channel, ts, `❌ Build failed for \`${repo}\``, errorBlocks('❌ Build failed', repo, msg));
+    _appendTurn(convKey, { role: 'assistant', content: `❌ Build failed for \`${repo}\`: ${msg}` });
     return;
   }
 
@@ -1066,6 +1297,7 @@ async function handleDeploy(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await update(client, channel, ts, `❌ ECS deploy failed`, errorBlocks('❌ ECS deploy failed', repo, msg));
+    _appendTurn(convKey, { role: 'assistant', content: `❌ ECS deploy failed for \`${repo}\`: ${msg}` });
     return;
   }
 
@@ -1083,6 +1315,7 @@ async function handleDeploy(
       ? `Tunnel URL didn't appear in time. Check CloudWatch → \`${repo}-ngrok\`.`
       : (err instanceof Error ? err.message : String(err));
     await update(client, channel, ts, `⚠️ Deployed, tunnel timeout`, errorBlocks('⚠️ Deployed but tunnel not found', repo, msg));
+    _appendTurn(convKey, { role: 'assistant', content: `⚠️ \`${repo}\` deployed but tunnel didn't come up: ${msg}` });
     return;
   }
 
@@ -1091,6 +1324,7 @@ async function handleDeploy(
     `✅ \`${repo}\` is live at ${url}`,
     statusBlocks({ repo, branch, port, actor, stage: 'done', sha, url }),
   );
+  _appendTurn(convKey, { role: 'assistant', content: `✅ \`${repo}\` is live at ${url}` });
 
   // Notify #tangent-deployments with the live URL
   if (channel !== DEPLOY_CHANNEL) {
@@ -1113,6 +1347,7 @@ async function handleDeploy(
 async function handleTeardown(
   { channel, threadTs, userId, client }: Ctx,
   { repo }: { repo: string },
+  convKey: string,
 ): Promise<void> {
   const actor = userId ? `<@${userId}>` : 'someone';
   const ts = await post(client, channel, threadTs, `🛑 Stopping \`${repo}\`...`);
@@ -1125,9 +1360,11 @@ async function handleTeardown(
     await update(client, channel, ts, text, [
       { type: 'section', text: { type: 'mrkdwn', text } },
     ]);
+    _appendTurn(convKey, { role: 'assistant', content: text });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await update(client, channel, ts, `❌ Stop failed`, errorBlocks('❌ Stop failed', repo, msg));
+    _appendTurn(convKey, { role: 'assistant', content: `❌ Stop failed for \`${repo}\`: ${msg}` });
   }
 }
 
@@ -1435,7 +1672,9 @@ async function handleInjectSecret(
   convKey: string,
 ): Promise<void> {
   if (ctx.userId !== APPROVER_ID) {
-    await post(ctx.client, ctx.channel, ctx.threadTs, '🔒 Only Daanish can inject secrets into services.');
+    const msg = '🔒 Only Daanish can inject secrets into services.';
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
     return;
   }
 
@@ -1545,7 +1784,9 @@ async function handlePutSecret(
   convKey: string,
 ): Promise<void> {
   if (ctx.userId !== APPROVER_ID) {
-    await post(ctx.client, ctx.channel, ctx.threadTs, '🔒 Only Daanish can write to Secrets Manager.');
+    const msg = '🔒 Only Daanish can write to Secrets Manager.';
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
     return;
   }
 
@@ -1583,12 +1824,20 @@ async function handlePutSecret(
   }
 }
 
-async function handleRememberPerson(input: { user_id: string; name: string; note: string }): Promise<void> {
-  const { readFileSync, writeFileSync, mkdirSync } = await import('fs');
+async function handleRememberPerson(
+  ctx: Ctx,
+  input: { user_id: string; name: string; note: string },
+  convKey: string,
+): Promise<void> {
+  const { readFileSync, writeFileSync } = await import('fs');
   const { resolve } = await import('path');
   const { execSync } = await import('child_process');
 
   const peopleFile = resolve(process.cwd(), 'config/people.json');
+
+  let persisted = false;
+  let commitSha: string | undefined;
+  let errMsg: string | undefined;
 
   try {
     type PersonEntry = { id: string; name: string; notes: string[] };
@@ -1618,10 +1867,32 @@ async function handleRememberPerson(input: { user_id: string; name: string; note
       `git -C "${process.cwd()}" push origin main`,
       { stdio: 'pipe' },
     );
-    logger.info({ action: 'remember_person:persisted', userId: input.user_id }, 'Memory saved to GitHub');
+    persisted = true;
+    try {
+      commitSha = execSync(`git -C "${process.cwd()}" rev-parse --short HEAD`, { stdio: ['pipe', 'pipe', 'pipe'] })
+        .toString().trim();
+    } catch { /* best-effort */ }
+    logger.info({ action: 'remember_person:persisted', userId: input.user_id, commitSha }, 'Memory saved to GitHub');
   } catch (err) {
-    logger.warn({ action: 'remember_person:failed', err }, 'Failed to persist person memory');
+    errMsg = err instanceof Error ? err.message : String(err);
+    logger.warn({ action: 'remember_person:failed', err: errMsg }, 'Failed to persist person memory');
   }
+
+  // Always post a visible confirmation — without it, the DM conversation store
+  // has no assistant turn for this action, and Claude re-calls the tool on the
+  // next user message because it looks like the request was never handled.
+  const notePreview = input.note.length > 140 ? input.note.slice(0, 140) + '…' : input.note;
+  let msg: string;
+  if (persisted) {
+    const shaNote = commitSha ? ` (commit \`${commitSha}\`)` : '';
+    msg = `🧠 Noted about *${input.name}*: _${notePreview}_\nSaved to \`config/people.json\` and pushed to \`main\`${shaNote}.`;
+  } else if (errMsg) {
+    msg = `🧠 Noted about *${input.name}* in memory: _${notePreview}_\n⚠️ Could NOT push to GitHub: _${errMsg}_ — the note will be lost on next restart.`;
+  } else {
+    msg = `🧠 Noted about *${input.name}*: _${notePreview}_`;
+  }
+  await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+  _appendTurn(convKey, { role: 'assistant', content: msg });
 }
 
 // ─── Block Kit helpers ────────────────────────────────────────────────────────

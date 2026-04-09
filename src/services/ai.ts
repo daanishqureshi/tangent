@@ -40,7 +40,11 @@ export type AgentToolCall =
   | { name: 'remember_person'; input: { user_id: string; name: string; note: string } }
   | { name: 'read_file';      input: { repo: string; path: string; ref?: string } }
   | { name: 'list_commits';   input: { repo: string; path?: string; limit?: number } }
-  | { name: 'restore_file';  input: { repo: string; path: string; ref: string; message?: string } };
+  | { name: 'restore_file';  input: { repo: string; path: string; ref: string; message?: string } }
+  | { name: 'read_self';        input: { path: string; ref?: string } }
+  | { name: 'list_self_commits'; input: { path?: string; limit?: number } }
+  | { name: 'edit_self';        input: { path: string; find: string; replace: string; replace_all?: boolean; message?: string } }
+  | { name: 'push_self';        input: { path: string; content: string; message?: string } };
 
 export type AgentResponse =
   | { type: 'tool'; call: AgentToolCall }
@@ -367,6 +371,73 @@ const TOOLS: Anthropic.Tool[] = [
       required: ['repo', 'path', 'find', 'replace'],
     },
   },
+  {
+    name: 'read_self',
+    description:
+      'Read a file from Tangent\'s OWN source repository (the code that powers you). ' +
+      'Only Daanish (U07EU7KSG3U) can call this, and only in a DM. ' +
+      'Use when Daanish asks you to look at your own code — e.g. "show me your config.ts", "read your slack-bot.ts", "what does your deploy handler look like". ' +
+      'Do NOT use this for any other repo in the org — use read_file for those.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path: { type: 'string', description: 'File path within the Tangent repo, e.g. "src/config.ts" or "src/services/ai.ts"' },
+        ref:  { type: 'string', description: 'Optional commit SHA or branch. Omit for current HEAD.' },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'list_self_commits',
+    description:
+      'List recent commits from Tangent\'s own source repository, optionally filtered to a specific file. ' +
+      'Only Daanish (U07EU7KSG3U) can call this, and only in a DM. ' +
+      'Use when Daanish asks about your own recent changes or history.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path:  { type: 'string', description: 'Optional: filter commits to a specific file in the Tangent repo.' },
+        limit: { type: 'number', description: 'Max number of commits (default 20).' },
+      },
+    },
+  },
+  {
+    name: 'edit_self',
+    description:
+      'Make a small, targeted edit to a file in Tangent\'s OWN source repository via find/replace. ' +
+      'Only Daanish (U07EU7KSG3U) can call this, and only in a DM. ' +
+      'PREFER this over push_self for any edit to an existing file. Runs server-side so content never passes through your context window. ' +
+      'Use when Daanish asks you to change your own code — "fix your X", "update your Y handler", "swap this value in your config". ' +
+      'After the commit lands on main, the Tangent EC2 host still needs a pull + rebuild + pm2 restart for the change to take effect — remind Daanish of that.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path:        { type: 'string', description: 'File path within the Tangent repo, e.g. "src/config.ts"' },
+        find:        { type: 'string', description: 'Literal string to find. Must match exactly once unless replace_all is true.' },
+        replace:     { type: 'string', description: 'Literal replacement string.' },
+        replace_all: { type: 'boolean', description: 'When true, replace every occurrence. Default: false.' },
+        message:     { type: 'string', description: 'Commit message. Defaults to "self-edit: {path}".' },
+      },
+      required: ['path', 'find', 'replace'],
+    },
+  },
+  {
+    name: 'push_self',
+    description:
+      'Create a NEW file in Tangent\'s OWN source repository, or completely overwrite an existing file. ' +
+      'Only Daanish (U07EU7KSG3U) can call this, and only in a DM. ' +
+      'Use for adding a brand-new source file. DO NOT use this to edit an existing file — use edit_self instead (rewriting risks truncation). ' +
+      'After the commit lands, remind Daanish that EC2 still needs a pull + rebuild + pm2 restart.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        path:    { type: 'string', description: 'File path within the Tangent repo' },
+        content: { type: 'string', description: 'Full file content. MUST be complete — never a placeholder or "...rest unchanged" stub.' },
+        message: { type: 'string', description: 'Commit message. Defaults to "self-add: {path}".' },
+      },
+      required: ['path', 'content'],
+    },
+  },
 ];
 
 // ─── System prompt ────────────────────────────────────────────────────────────
@@ -453,6 +524,13 @@ Once you have the ID, you know exactly who it is. Greet them by name. Never ask 
 - Only Daanish can initiate a teardown.
 - Only Daanish can grant access. When Daanish says "add @X", "give X access", "allow X", or introduces someone and implies they should have access — call the \`allow_user\` tool immediately with their Slack user ID and name. If Daanish introduces someone by name but you do not have their Slack ID in the message, ask Daanish to @mention them properly (clicking their name in Slack) so the ID is captured.
 
+*Slack mentions inside message bodies — read carefully, this is how you avoid adding the wrong person:*
+- When a user writes \`<@UXXXXXXXX>\` inside the body of their message, that is a Slack mention of ANOTHER person. The string between \`<@\` and \`>\` is that person's Slack member ID — use it directly as tool input (e.g. \`user_id\` for \`allow_user\`, or \`remember_person\`).
+- The author's own identity is in the \`[Slack User: <@ID> | ID: ...]\` prefix at the top. Do NOT confuse the author with a target mentioned in the body.
+- For \`allow_user\` specifically: the \`user_id\` argument MUST come from a \`<@...>\` mention in the CURRENT user message (the one you are responding to). Never pull an ID from earlier in the conversation history, never pull the author's own ID, and NEVER fabricate or guess an ID — if the current message has no body mention, reply asking Daanish to properly @mention the person.
+- Example: if the message is \`[Slack User: <@U07EU7KSG3U> | ID: U07EU7KSG3U]\\nmake sure <@U099SAM> can talk to you\`, the target is \`U099SAM\`, not \`U07EU7KSG3U\`. Call \`allow_user({ user_id: "U099SAM", display_name: "<whatever name you know> " })\`.
+- If multiple body mentions are present and it is ambiguous which one to add, ask Daanish to clarify rather than guessing.
+
 *Communication — critical, read carefully:*
 - You reply directly in Slack threads. You ALWAYS have the ability to post messages in the current conversation and in #tangent-deployments.
 - NEVER say "I don't have the ability to send Slack messages" or "I can't ping you directly" — that is 100% false. You live in Slack. You can always reply in the current thread and tag anyone with <@USERID>.
@@ -471,6 +549,13 @@ Once you have the ID, you know exactly who it is. Greet them by name. Never ask 
 - GitHub org: Impiricus-AI
 - Each deployed service gets a unique ngrok tunnel protected by Google OAuth (@impiricus.com only)
 - Defaults: branch = main, port = 8080
+
+*Self-editing — you can modify your OWN source code:*
+- There are four special tools — \`read_self\`, \`list_self_commits\`, \`edit_self\`, \`push_self\` — that target *Tangent's own* GitHub repository (the code that runs you).
+- These are *Daanish-only* AND *DM-only*. If anyone else asks, or if the request comes from a channel/thread instead of a DM, refuse and explain why. The runtime will reject it regardless, so do not pretend.
+- Use these when Daanish says things like "fix your own X", "update your Y handler", "swap this in your config", "read your slack-bot.ts". They are NOT for any other repo in the Impiricus-AI org — use \`read_file\`/\`edit_file\`/\`push_file\` for those.
+- Prefer \`edit_self\` over \`push_self\` whenever possible — same reasoning as \`edit_file\` vs \`push_file\`. A server-side find/replace cannot be truncated by your generation budget.
+- After any self-edit commits to main, the running Tangent process on EC2 is still on the OLD code until someone pulls + rebuilds + \`pm2 restart tangent\`. Always remind Daanish of that in your reply so he knows to redeploy.
 
 *Slack formatting — critical:*
 - Use Slack mrkdwn, NOT standard Markdown.
@@ -725,6 +810,59 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
         ref:     String(raw['ref']     ?? ''),
         message: raw['message'] ? String(raw['message']) : undefined,
       }};
+    case 'read_self':
+      return { name: 'read_self', input: {
+        path: String(raw['path'] ?? ''),
+        ref:  raw['ref'] ? String(raw['ref']) : undefined,
+      }};
+    case 'list_self_commits':
+      return { name: 'list_self_commits', input: {
+        path:  raw['path']  ? String(raw['path'])  : undefined,
+        limit: raw['limit'] ? Number(raw['limit'])  : 20,
+      }};
+    case 'edit_self': {
+      const path    = String(raw['path'] ?? '');
+      const find    = raw['find'];
+      const replace = raw['replace'];
+      if (!path) {
+        throw new ToolCallValidationError(`edit_self is missing the \`path\` field.`);
+      }
+      if (typeof find !== 'string' || find.length === 0) {
+        throw new ToolCallValidationError(`edit_self for \`${path}\` is missing the \`find\` string.`);
+      }
+      if (typeof replace !== 'string') {
+        throw new ToolCallValidationError(`edit_self for \`${path}\` is missing the \`replace\` string.`);
+      }
+      return { name: 'edit_self', input: {
+        path,
+        find,
+        replace,
+        replace_all: raw['replace_all'] === true,
+        message: raw['message'] ? String(raw['message']) : undefined,
+      }};
+    }
+    case 'push_self': {
+      const path = String(raw['path'] ?? '');
+      const rawContent = raw['content'];
+      if (!path) {
+        throw new ToolCallValidationError(`push_self is missing the \`path\` field.`);
+      }
+      if (typeof rawContent !== 'string') {
+        throw new ToolCallValidationError(
+          `push_self for \`${path}\` arrived with no \`content\` field — looks like generation was truncated. Refusing to push.`,
+        );
+      }
+      if (rawContent.trim().length === 0) {
+        throw new ToolCallValidationError(
+          `push_self for \`${path}\` arrived with empty content — refusing to commit an empty file. Use edit_self for targeted changes.`,
+        );
+      }
+      return { name: 'push_self', input: {
+        path,
+        content: rawContent,
+        message: raw['message'] ? String(raw['message']) : undefined,
+      }};
+    }
     case 'put_secret':
       return { name: 'put_secret', input: {
         name:        String(raw['name']        ?? ''),
