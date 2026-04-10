@@ -110,6 +110,15 @@ function _clearPending(convKey: string): void {
   _pendingConfirmations.delete(convKey);
 }
 
+// ─── Per-conversation processing lock ───────────────────────────────────────
+//
+// Prevents concurrent processMessage calls for the same conversation.
+// Without this, impatient follow-up messages ("did you add the others too?")
+// spawn parallel route() calls that re-trigger the same tool chain, causing
+// repeated/duplicated actions (e.g. saving the same secret three times).
+//
+const _processingLock = new Set<string>();
+
 // Consent classification is handled by classifyConsent() in ai.ts (Claude haiku).
 // These stubs remain for call-site compatibility but are no longer used directly —
 // the async classifier is called in route() instead.
@@ -428,6 +437,33 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
 
   const convKey = _convKey(ctx.channel, ctx.threadTs, source);
 
+  // ── Concurrency guard ─────────────────────────────────────────────────────
+  // If we're already processing a message for this conversation (e.g. chaining
+  // tool calls), don't start another pass — the follow-up will just duplicate
+  // work.  Post a brief "still working" note so the user knows we heard them.
+  if (_processingLock.has(convKey)) {
+    logger.info({ action: 'route:busy', convKey }, 'Skipping — already processing');
+    await post(ctx.client, ctx.channel, ctx.threadTs, '_Still working on the last request — hang tight._');
+    return;
+  }
+
+  _processingLock.add(convKey);
+  try {
+    await _routeInner(ctx, text, source, messageTs, resolvedUserId, convKey);
+  } finally {
+    _processingLock.delete(convKey);
+  }
+}
+
+// The actual routing logic, extracted so route() can wrap it in a processing lock.
+async function _routeInner(
+  ctx: Ctx,
+  text: string,
+  source: 'mention' | 'dm',
+  messageTs: string,
+  resolvedUserId: string | undefined,
+  convKey: string,
+): Promise<void> {
   // ── Check for pending confirmation first ───────────────────────────────────
   // If a deploy/teardown is waiting for approval, handle yes/no before
   // doing anything else.
@@ -527,17 +563,19 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
       urlNote,
       `• Cluster: \`tangent\` (us-east-1)`,
       '',
-      `<@${APPROVER_ID}> — reply *yes* to approve or *no* to cancel.`,
+      `${requester} — reply *yes* to approve or *no* to cancel.`,
     ].join('\n');
 
-    // Post confirmation in the current thread
-    _setPending(convKey, call, prompt, APPROVER_ID, ctx.userId);
+    // Post confirmation in the current thread.
+    // No requiredApproverId — any authorised user (including the requester)
+    // can approve a deploy. Teardowns remain Daanish-only.
+    _setPending(convKey, call, prompt, undefined, ctx.userId);
     await post(ctx.client, ctx.channel, ctx.threadTs, prompt);
     _appendTurn(convKey, { role: 'assistant', content: prompt });
 
     // Also notify #tangent-deployments if the request didn't come from there
     if (ctx.channel !== DEPLOY_CHANNEL) {
-      const notif = `📣 Deploy request for \`${repo}\` (from ${requester}) — awaiting <@${APPROVER_ID}>'s approval.`;
+      const notif = `📣 Deploy request for \`${repo}\` (from ${requester}) — awaiting approval.`;
       await post(ctx.client, DEPLOY_CHANNEL, DEPLOY_CHANNEL, notif);
     }
     return;
@@ -573,12 +611,16 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
     return;
   }
 
-  // All other tools run in the background — route() returns immediately so
-  // Tangent can handle the next message while the task is still in flight.
-  // The tool updates the Slack message directly when it completes.
-  void executeToolCall(call, ctx, convKey, text, history).catch((err) => {
-    logger.error({ action: 'slack_bot:background_tool_error', err }, 'Background tool call failed');
-  });
+  // Await tool execution so the per-conversation processing lock (held by
+  // route()) stays active until the full tool chain completes.  Without this,
+  // impatient follow-up messages spawn concurrent processMessage calls that
+  // re-trigger the same tool (e.g. saving the same secret 3×).
+  // Other conversations are NOT blocked — the lock is per-convKey.
+  try {
+    await executeToolCall(call, ctx, convKey, text, history);
+  } catch (err) {
+    logger.error({ action: 'slack_bot:tool_error', err }, 'Tool call failed');
+  }
 }
 
 // ─── Tool executor ────────────────────────────────────────────────────────────
@@ -805,9 +847,9 @@ async function gatePushFile(
     preview,
     '```',
     '',
-    `<@${APPROVER_ID}> — reply *yes* to push or *no* to cancel.`,
+    `Reply *yes* to push or *no* to cancel.`,
   ].join('\n');
-  _setPending(convKey, call, prompt, APPROVER_ID, ctx.userId);
+  _setPending(convKey, call, prompt, undefined, ctx.userId);
   await post(ctx.client, ctx.channel, ctx.threadTs, prompt);
   _appendTurn(convKey, { role: 'assistant', content: prompt });
   return 'gated';
@@ -1328,7 +1370,7 @@ async function handleDeploy(
 
   // Notify #tangent-deployments with the live URL
   if (channel !== DEPLOY_CHANNEL) {
-    const notif = `✅ *\`${repo}\` is live!*\n🔗 ${url}\n_Deployed by ${actor} — approved by <@${APPROVER_ID}>_`;
+    const notif = `✅ *\`${repo}\` is live!*\n🔗 ${url}\n_Deployed by ${actor}_`;
     await post(client, DEPLOY_CHANNEL, DEPLOY_CHANNEL, notif);
   }
 
