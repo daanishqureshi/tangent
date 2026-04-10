@@ -711,6 +711,33 @@ async function executeToolCall(
 }
 
 /**
+ * Feed a tool result through Claude so the response is natural language,
+ * not a canned template.  Used by action handlers (inject_secret, put_secret)
+ * that have already done their work and just need a conversational reply.
+ */
+async function _synthesizeAndReply(
+  ctx: Ctx,
+  convKey: string,
+  placeholderTs: string,
+  call: AgentToolCall,
+  rawResult: string,
+): Promise<void> {
+  try {
+    const history = _getHistory(convKey);
+    // Use the last user turn as context, or a generic fallback
+    const lastUserTurn = [...history].reverse().find((t) => t.role === 'user');
+    const userMessage = lastUserTurn?.content ?? `Please ${call.name.replace(/_/g, ' ')}`;
+    const reply = await synthesizeToolResult(call, rawResult, userMessage, history);
+    await update(ctx.client, ctx.channel, placeholderTs, reply);
+    _appendTurn(convKey, { role: 'assistant', content: reply });
+  } catch {
+    // Fallback to raw result if Claude synthesis fails
+    await update(ctx.client, ctx.channel, placeholderTs, rawResult);
+    _appendTurn(convKey, { role: 'assistant', content: rawResult });
+  }
+}
+
+/**
  * For read-only / informational tools:
  * 1. Post a placeholder ("working on it...")
  * 2. Fetch the raw tool data
@@ -1782,13 +1809,12 @@ async function handleInjectSecret(
       forceNewDeployment: true,
     }));
 
-    const msg = `✅ \`${secret_name}\` is now wired into \`${repo}\` as an env var. New deployment triggered — the container will restart with the secret available as \`os.environ["${secret_name}"]\`.`;
-    await update(ctx.client, ctx.channel, ts, msg);
-    _appendTurn(convKey, { role: 'assistant', content: msg });
+    // Feed result through Claude so the reply is conversational, not a template
+    const rawResult = `Successfully wired secret "${secret_name}" into service "${repo}". A new ECS deployment was triggered — the container will restart with the secret available as an environment variable.`;
+    await _synthesizeAndReply(ctx, convKey, ts, { name: 'inject_secret', input } as AgentToolCall, rawResult);
   } catch (err) {
-    const msg = `❌ Failed to inject secret: ${err instanceof Error ? err.message : String(err)}`;
-    await update(ctx.client, ctx.channel, ts, msg);
-    _appendTurn(convKey, { role: 'assistant', content: msg });
+    const rawErr = `Failed to inject secret "${secret_name}" into "${repo}": ${err instanceof Error ? err.message : String(err)}`;
+    await _synthesizeAndReply(ctx, convKey, ts, { name: 'inject_secret', input } as AgentToolCall, rawErr);
   }
 }
 
@@ -1844,13 +1870,11 @@ async function handlePutSecret(
       }
     }
 
-    const msg = `✅ Secret \`${input.name}\` saved to Secrets Manager.${input.description ? ` (${input.description})` : ''}`;
-    await update(ctx.client, ctx.channel, ts, msg);
-    _appendTurn(convKey, { role: 'assistant', content: msg });
+    const rawResult = `Successfully saved secret "${input.name}" to Secrets Manager.${input.description ? ` Description: ${input.description}` : ''}`;
+    await _synthesizeAndReply(ctx, convKey, ts, { name: 'put_secret', input } as AgentToolCall, rawResult);
   } catch (err) {
-    const msg = `❌ Failed to save secret \`${input.name}\`: ${err instanceof Error ? err.message : String(err)}`;
-    await update(ctx.client, ctx.channel, ts, msg);
-    _appendTurn(convKey, { role: 'assistant', content: msg });
+    const rawErr = `Failed to save secret "${input.name}": ${err instanceof Error ? err.message : String(err)}`;
+    await _synthesizeAndReply(ctx, convKey, ts, { name: 'put_secret', input } as AgentToolCall, rawErr);
   }
 }
 
