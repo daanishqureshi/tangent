@@ -20,7 +20,7 @@ import { App, LogLevel } from '@slack/bolt';
 import type { WebClient } from '@slack/web-api';
 import type { KnownBlock } from '@slack/types';
 import { config, allowUser } from '../config.js';
-import { processMessage, synthesizeToolResult, continueAfterTool, classifyConsent, diagnoseServiceFailure, identifyFileToFix, generateCodeFix, type ConversationTurn, type AgentToolCall } from './ai.js';
+import { processMessage, continueAfterTool, classifyConsent, diagnoseServiceFailure, identifyFileToFix, generateCodeFix, type ConversationTurn, type AgentToolCall } from './ai.js';
 import { buildSkill, DockerfileNotFoundError, DockerBuildError } from '../skills/build.js';
 import { deploySkill } from '../skills/deploy.js';
 import { tunnelSkill, TunnelTimeoutError } from '../skills/tunnel.js';
@@ -681,12 +681,16 @@ async function executeToolCall(
       _appendTurn(convKey, { role: 'assistant', content: msg });
       break;
     }
-    case 'put_secret':
-      await handlePutSecret(ctx, call.input as { name: string; value: string; description?: string }, convKey);
+    case 'put_secret': {
+      const result = await handlePutSecret(ctx, call.input as { name: string; value: string; description?: string }, convKey);
+      await _chainIfNeeded(call, result, ctx, convKey, userMessage, history);
       break;
-    case 'inject_secret':
-      await handleInjectSecret(ctx, call.input as { repo: string; secret_name: string }, convKey);
+    }
+    case 'inject_secret': {
+      const result = await handleInjectSecret(ctx, call.input as { repo: string; secret_name: string }, convKey);
+      await _chainIfNeeded(call, result, ctx, convKey, userMessage, history);
       break;
+    }
     case 'remember_person':
       await handleRememberPerson(ctx, call.input as { user_id: string; name: string; note: string }, convKey);
       break;
@@ -711,29 +715,49 @@ async function executeToolCall(
 }
 
 /**
- * Feed a tool result through Claude so the response is natural language,
- * not a canned template.  Used by action handlers (inject_secret, put_secret)
- * that have already done their work and just need a conversational reply.
+ * After an action tool completes, check if Claude wants to chain to another
+ * tool (e.g. inject 3 secrets in sequence). If Claude responds with text,
+ * post it as a conversational reply. If it calls another tool, execute it.
+ *
+ * This is the key fix for "Tangent only injects one secret when asked to
+ * inject all" — without this, action tools were fire-and-forget with no
+ * follow-up call to Claude.
  */
-async function _synthesizeAndReply(
+async function _chainIfNeeded(
+  completedCall: AgentToolCall,
+  toolResult: string,
   ctx: Ctx,
   convKey: string,
-  placeholderTs: string,
-  call: AgentToolCall,
-  rawResult: string,
+  userMessage: string,
+  history: ConversationTurn[],
 ): Promise<void> {
+  // Record what just happened so Claude has context for the next decision
+  _appendTurn(convKey, { role: 'assistant', content: `${completedCall.name} result: ${toolResult}` });
+
+  const updatedHistory: ConversationTurn[] = [
+    ...history,
+    { role: 'user', content: userMessage },
+    { role: 'assistant', content: `${completedCall.name} result: ${toolResult}` },
+  ];
+
   try {
-    const history = _getHistory(convKey);
-    // Use the last user turn as context, or a generic fallback
-    const lastUserTurn = [...history].reverse().find((t) => t.role === 'user');
-    const userMessage = lastUserTurn?.content ?? `Please ${call.name.replace(/_/g, ' ')}`;
-    const reply = await synthesizeToolResult(call, rawResult, userMessage, history);
-    await update(ctx.client, ctx.channel, placeholderTs, reply);
-    _appendTurn(convKey, { role: 'assistant', content: reply });
+    const next = await continueAfterTool(completedCall, toolResult, userMessage, updatedHistory);
+
+    if (next.type === 'text') {
+      // Claude is done — post the conversational wrap-up
+      await post(ctx.client, ctx.channel, ctx.threadTs, next.text);
+      _appendTurn(convKey, { role: 'assistant', content: next.text });
+      return;
+    }
+
+    // Claude wants another tool — execute it (this recurses naturally for
+    // chains like inject_secret × 3, because the next inject_secret will
+    // also call _chainIfNeeded when it finishes)
+    await executeToolCall(next.call, ctx, convKey, userMessage, updatedHistory);
   } catch {
-    // Fallback to raw result if Claude synthesis fails
-    await update(ctx.client, ctx.channel, placeholderTs, rawResult);
-    _appendTurn(convKey, { role: 'assistant', content: rawResult });
+    // If continueAfterTool fails, just post the raw result as a fallback
+    await post(ctx.client, ctx.channel, ctx.threadTs, toolResult);
+    _appendTurn(convKey, { role: 'assistant', content: toolResult });
   }
 }
 
@@ -1739,8 +1763,7 @@ async function handleInjectSecret(
   ctx: Ctx,
   input: { repo: string; secret_name: string },
   convKey: string,
-): Promise<void> {
-
+): Promise<string> {
   const { repo, secret_name } = input;
   const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Wiring \`${secret_name}\` into \`${repo}\`...`);
 
@@ -1809,12 +1832,13 @@ async function handleInjectSecret(
       forceNewDeployment: true,
     }));
 
-    // Feed result through Claude so the reply is conversational, not a template
-    const rawResult = `Successfully wired secret "${secret_name}" into service "${repo}". A new ECS deployment was triggered — the container will restart with the secret available as an environment variable.`;
-    await _synthesizeAndReply(ctx, convKey, ts, { name: 'inject_secret', input } as AgentToolCall, rawResult);
+    const result = `Successfully wired secret "${secret_name}" into service "${repo}". A new ECS deployment was triggered.`;
+    await update(ctx.client, ctx.channel, ts, `✓ injected \`${secret_name}\` into \`${repo}\``);
+    return result;
   } catch (err) {
-    const rawErr = `Failed to inject secret "${secret_name}" into "${repo}": ${err instanceof Error ? err.message : String(err)}`;
-    await _synthesizeAndReply(ctx, convKey, ts, { name: 'inject_secret', input } as AgentToolCall, rawErr);
+    const result = `Failed to inject secret "${secret_name}" into "${repo}": ${err instanceof Error ? err.message : String(err)}`;
+    await update(ctx.client, ctx.channel, ts, `❌ ${result}`);
+    return result;
   }
 }
 
@@ -1844,8 +1868,7 @@ async function handlePutSecret(
   ctx: Ctx,
   input: { name: string; value: string; description?: string },
   convKey: string,
-): Promise<void> {
-
+): Promise<string> {
   const { CreateSecretCommand, PutSecretValueCommand, ResourceExistsException } = await import('@aws-sdk/client-secrets-manager');
   const { smClient } = await import('./aws.js');
 
@@ -1870,11 +1893,13 @@ async function handlePutSecret(
       }
     }
 
-    const rawResult = `Successfully saved secret "${input.name}" to Secrets Manager.${input.description ? ` Description: ${input.description}` : ''}`;
-    await _synthesizeAndReply(ctx, convKey, ts, { name: 'put_secret', input } as AgentToolCall, rawResult);
+    const result = `Successfully saved secret "${input.name}" to Secrets Manager.${input.description ? ` Description: ${input.description}` : ''}`;
+    await update(ctx.client, ctx.channel, ts, `✓ saved \`${input.name}\``);
+    return result;
   } catch (err) {
-    const rawErr = `Failed to save secret "${input.name}": ${err instanceof Error ? err.message : String(err)}`;
-    await _synthesizeAndReply(ctx, convKey, ts, { name: 'put_secret', input } as AgentToolCall, rawErr);
+    const result = `Failed to save secret "${input.name}": ${err instanceof Error ? err.message : String(err)}`;
+    await update(ctx.client, ctx.channel, ts, `❌ ${result}`);
+    return result;
   }
 }
 
