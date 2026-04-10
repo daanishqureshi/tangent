@@ -1713,12 +1713,6 @@ async function handleInjectSecret(
   input: { repo: string; secret_name: string },
   convKey: string,
 ): Promise<void> {
-  if (ctx.userId !== APPROVER_ID) {
-    const msg = '🔒 Only Daanish can inject secrets into services.';
-    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
-    _appendTurn(convKey, { role: 'assistant', content: msg });
-    return;
-  }
 
   const { repo, secret_name } = input;
   const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Wiring \`${secret_name}\` into \`${repo}\`...`);
@@ -1825,12 +1819,6 @@ async function handlePutSecret(
   input: { name: string; value: string; description?: string },
   convKey: string,
 ): Promise<void> {
-  if (ctx.userId !== APPROVER_ID) {
-    const msg = '🔒 Only Daanish can write to Secrets Manager.';
-    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
-    _appendTurn(convKey, { role: 'assistant', content: msg });
-    return;
-  }
 
   const { CreateSecretCommand, PutSecretValueCommand, ResourceExistsException } = await import('@aws-sdk/client-secrets-manager');
   const { smClient } = await import('./aws.js');

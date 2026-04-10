@@ -220,7 +220,6 @@ const TOOLS: Anthropic.Tool[] = [
     name: 'inject_secret',
     description:
       'Wire a secret from AWS Secrets Manager as an environment variable into a deployed ECS service. ' +
-      'Only Daanish (U07EU7KSG3U) can do this. ' +
       'Use when someone says "inject X into repo Y", "wire secret X to service Y", "add env var X from secrets manager to Y", ' +
       'or when a service is crashing because it cannot find a secret/env var. ' +
       'This re-registers the task definition with the secret injected and force-deploys the service — no code change needed. ' +
@@ -262,8 +261,8 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: 'put_secret',
     description:
-      'Create or update a secret value in AWS Secrets Manager. Only Daanish (U07EU7KSG3U) can do this. ' +
-      'Use when Daanish says "add a secret", "store X in secrets manager", "update the value for X", or "set secret X to Y". ' +
+      'Create or update a secret value in AWS Secrets Manager. ' +
+      'Use when someone says "add a secret", "store X in secrets manager", "update the value for X", or "set secret X to Y". ' +
       'name is the secret name (e.g. "ANTHROPIC_API_KEY"). value is the secret string. description is optional.',
     input_schema: {
       type: 'object' as const,
@@ -536,7 +535,7 @@ Once you have the ID, you know exactly who it is. Greet them by name. Never ask 
 - All production secrets live in AWS Secrets Manager (us-east-1).
 - Use \`list_secrets\` whenever someone asks about configured secrets, env vars, credentials, or what's stored — names only, never values.
 - When an engineer says a service needs an env var or credential, suggest they check Secrets Manager first using \`list_secrets\` before asking Daanish to add a new one.
-- Only Daanish can write secrets. Use \`put_secret\` immediately when Daanish asks — no confirmation dialog needed since Daanish asking IS the authorisation.
+- Any authorised user can write and inject secrets. Use \`put_secret\` immediately when asked — no confirmation dialog needed. Use \`inject_secret\` to wire a secret into a running service's task definition.
 - NEVER echo a secret value back in Slack, even if you somehow have it. Names only.
 
 *Infrastructure:*
