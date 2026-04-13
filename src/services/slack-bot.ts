@@ -524,7 +524,7 @@ async function _routeInner(
 
   // Deploy and teardown require explicit confirmation before executing
   if (call.name === 'deploy') {
-    const { repo, branch, port, freshUrl } = call.input as { repo: string; branch: string; port: number; freshUrl?: boolean };
+    let { repo, branch, port, freshUrl } = call.input as { repo: string; branch: string; port: number; freshUrl?: boolean };
 
     // ── Validate repo exists in GitHub before showing confirmation ─────────
     let allRepos: { name: string }[];
@@ -543,6 +543,26 @@ async function _routeInner(
       await post(ctx.client, ctx.channel, ctx.threadTs, errMsg);
       _appendTurn(convKey, { role: 'assistant', content: errMsg });
       return;
+    }
+
+    // ── Auto-detect port from Dockerfile EXPOSE if Claude defaulted to 8080 ─
+    // The LLM frequently forgets to pass the right port even when inspect_repo
+    // showed it. This catches the mismatch before it causes a broken deploy.
+    if (port === 8080) {
+      try {
+        const info = await inspectRepo(repo);
+        if (info.exposedPort && info.exposedPort !== 8080) {
+          logger.info(
+            { action: 'deploy:port_override', repo, requested: port, dockerfile: info.exposedPort },
+            `Overriding default port 8080 → ${info.exposedPort} (from Dockerfile EXPOSE)`,
+          );
+          port = info.exposedPort;
+          // Update the call input so the downstream deploy skill uses the right port
+          (call.input as Record<string, unknown>)['port'] = port;
+        }
+      } catch {
+        // If inspect fails, proceed with the requested port — it'll fail at deploy anyway
+      }
     }
 
     // Show the URL that will be used — reused or fresh — so user knows upfront
