@@ -1764,7 +1764,15 @@ async function handleInjectSecret(
   input: { repo: string; secret_name: string },
   convKey: string,
 ): Promise<string> {
-  const { repo, secret_name } = input;
+  let { secret_name } = input;
+  const { repo } = input;
+
+  // Enforce tangent/ prefix — the ECS execution role IAM policy only grants
+  // GetSecretValue on tangent/*. If the caller passes a bare name, auto-prefix.
+  if (!secret_name.startsWith('tangent/')) {
+    secret_name = `tangent/${secret_name}`;
+  }
+
   const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Wiring \`${secret_name}\` into \`${repo}\`...`);
 
   try {
@@ -1803,10 +1811,13 @@ async function handleInjectSecret(
     const appContainer = containers.find((c) => c.name === 'app');
     if (!appContainer) throw new Error('No "app" container found in task definition');
 
-    // 3. Add/update the secret in the app container (dedupe by name)
+    // 3. Add/update the secret in the app container (dedupe by name).
+    // The env var name exposed to the app should be the bare key (e.g. ASANA_PAT),
+    // NOT the full Secrets Manager path (tangent/ASANA_PAT). Strip the prefix.
+    const envVarName = secret_name.replace(/^tangent\//, '');
     const existingSecrets = appContainer.secrets ?? [];
-    const filtered = existingSecrets.filter((s) => s.name !== secret_name);
-    appContainer.secrets = [...filtered, { name: secret_name, valueFrom: secretArn }];
+    const filtered = existingSecrets.filter((s) => s.name !== envVarName);
+    appContainer.secrets = [...filtered, { name: envVarName, valueFrom: secretArn }];
 
     // 4. Re-register the task definition with the new secret
     const registerResult = await ecsClient().send(new RegisterTaskDefinitionCommand({
@@ -1869,6 +1880,13 @@ async function handlePutSecret(
   input: { name: string; value: string; description?: string },
   convKey: string,
 ): Promise<string> {
+  // Enforce tangent/ prefix — the ECS execution role IAM policy only grants
+  // GetSecretValue on tangent/*. Secrets without this prefix cause
+  // AccessDeniedException at container startup.
+  if (!input.name.startsWith('tangent/')) {
+    input = { ...input, name: `tangent/${input.name}` };
+  }
+
   const { CreateSecretCommand, PutSecretValueCommand, ResourceExistsException } = await import('@aws-sdk/client-secrets-manager');
   const { smClient } = await import('./aws.js');
 
