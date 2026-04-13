@@ -1816,7 +1816,24 @@ async function handleInjectSecret(
     // NOT the full Secrets Manager path (tangent/ASANA_PAT). Strip the prefix.
     const envVarName = secret_name.replace(/^tangent\//, '');
     const existingSecrets = appContainer.secrets ?? [];
-    const filtered = existingSecrets.filter((s) => s.name !== envVarName);
+    const filtered = existingSecrets
+      // Remove any existing entry with the same env var name (exact match)
+      .filter((s) => s.name !== envVarName)
+      // Also remove any entry whose env var name matches with tangent/ prefix
+      // (from before the prefix-stripping fix)
+      .filter((s) => s.name !== secret_name)
+      // Drop ALL secrets whose ARN references a non-tangent/ path — these
+      // cause AccessDeniedException at container startup because the ECS
+      // execution role only has GetSecretValue on tangent/*.
+      .filter((s) => {
+        const arn = s.valueFrom ?? '';
+        if (arn.includes(':secret:tangent/')) return true;
+        logger.warn(
+          { action: 'inject_secret:drop_unprefixed', name: s.name, arn },
+          `Dropping inherited secret "${s.name}" — ARN outside tangent/ prefix`,
+        );
+        return false;
+      });
     appContainer.secrets = [...filtered, { name: envVarName, valueFrom: secretArn }];
 
     // 4. Re-register the task definition with the new secret
