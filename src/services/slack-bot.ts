@@ -1623,21 +1623,29 @@ async function fetchLogs(repo: string, container: string): Promise<string> {
   const best = sorted[0];
   const streamName = best.logStreamName!;
 
+  // Only fetch logs from the last 30 minutes by default — stale logs from
+  // previous deployments are noise and confuse both Claude and the user.
+  const RECENT_WINDOW_MS = 30 * 60 * 1000;
+  const startTime = Date.now() - RECENT_WINDOW_MS;
+
   // Compute age of this stream's last event so stale data is clearly flagged
   const lastEventMs = best.lastEventTimestamp ?? 0;
   const ageMs = Date.now() - lastEventMs;
   const ageHours = Math.floor(ageMs / (1000 * 60 * 60));
   const ageMinutes = Math.floor((ageMs % (1000 * 60 * 60)) / (1000 * 60));
   const ageStr = ageHours > 0 ? `${ageHours}h ${ageMinutes}m ago` : `${ageMinutes}m ago`;
-  const staleWarning = ageMs > 2 * 60 * 60 * 1000
-    ? `⚠️ WARNING: These logs are from ${ageStr} — this is likely a previous deployment. Consider running "clear logs for ${repo}" to wipe old streams.\n\n`
-    : '';
+
+  // If the entire stream is older than our window, say so explicitly
+  if (lastEventMs < startTime) {
+    return `No recent logs for "${repo}" (${container} container). Last log entry was ${ageStr} — likely from a previous deployment. The current container may still be starting up, or it crashed before emitting any logs. Try again in 30-60 seconds, or run "clear logs for ${repo}" to wipe stale streams.`;
+  }
 
   let events: string[] = [];
   try {
     const r = await cwlClient().send(new GetLogEventsCommand({
       logGroupName,
       logStreamName: streamName,
+      startTime,
       limit: 100,
       startFromHead: false,
     }));
@@ -1664,14 +1672,14 @@ async function fetchLogs(repo: string, container: string): Promise<string> {
 
     const recentLines = events.slice(-20).join('\n');
     if (tunnelUrl) {
-      return `${staleWarning}Ngrok tunnel URL for ${repo}: ${tunnelUrl}\n\nRecent ngrok logs (stream: ${streamName}, last activity: ${ageStr}):\n${recentLines}`;
+      return `Ngrok tunnel URL for ${repo}: ${tunnelUrl}\n\nRecent ngrok logs (stream: ${streamName}, last activity: ${ageStr}):\n${recentLines}`;
     }
-    return `${staleWarning}No tunnel URL found in recent ngrok logs for ${repo}. The ngrok container may be starting up or may have crashed.\n\nRecent ngrok logs (stream: ${streamName}, last activity: ${ageStr}):\n${recentLines}`;
+    return `No tunnel URL found in recent ngrok logs for ${repo}. The ngrok container may be starting up or may have crashed.\n\nRecent ngrok logs (stream: ${streamName}, last activity: ${ageStr}):\n${recentLines}`;
   }
 
   // For app container, return recent log lines
   const recentLines = events.slice(-30).join('\n');
-  return `${staleWarning}Recent app logs for ${repo} (stream: ${streamName}, last activity: ${ageStr}):\n${recentLines}`;
+  return `Recent app logs for ${repo} (stream: ${streamName}, last activity: ${ageStr}):\n${recentLines}`;
 }
 
 async function fetchClearLogs(repo: string, container: string): Promise<string> {
