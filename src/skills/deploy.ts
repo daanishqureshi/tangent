@@ -122,7 +122,21 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
   // always present on every app container regardless of what was there before.
   const inheritedSecrets = await fetchExistingAppSecrets(taskFamily);
   const sharedNames = new Set(sharedAppSecrets.map((s) => s.name));
-  const extraSecrets = inheritedSecrets.filter((s) => !sharedNames.has(s.name ?? ''));
+  const extraSecrets = inheritedSecrets
+    .filter((s) => !sharedNames.has(s.name ?? ''))
+    // Drop secrets whose ARN doesn't reference a tangent/ path — the ECS execution
+    // role (TangentSecretsAccess) only grants GetSecretValue on tangent/*.
+    // Inherited secrets from before the prefix convention cause
+    // AccessDeniedException → ResourceInitializationError on every deploy.
+    .filter((s) => {
+      const arn = s.valueFrom ?? '';
+      if (arn.includes(':secret:tangent/')) return true;
+      logger.warn(
+        { action: 'deploy:drop_unprefixed_secret', name: s.name, arn },
+        `Dropping inherited secret "${s.name}" — ARN is outside tangent/ prefix and would cause AccessDeniedException`,
+      );
+      return false;
+    });
   const appSecrets = [...sharedAppSecrets, ...extraSecrets];
   logger.info({ action: 'deploy:app_secrets', total: appSecrets.length }, 'App container secrets resolved');
 
