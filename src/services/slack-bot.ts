@@ -22,6 +22,7 @@ import type { KnownBlock } from '@slack/types';
 import { config, allowUser } from '../config.js';
 import { processMessage, continueAfterTool, classifyConsent, diagnoseServiceFailure, identifyFileToFix, generateCodeFix, type ConversationTurn, type AgentToolCall, type ToolChainStep } from './ai.js';
 import { buildSkill, DockerfileNotFoundError, DockerBuildError } from '../skills/build.js';
+import { runDeployAnalysis } from '../skills/analyze.js';
 import { deploySkill } from '../skills/deploy.js';
 import { tunnelSkill, TunnelTimeoutError } from '../skills/tunnel.js';
 import { teardownSkill } from '../skills/teardown.js';
@@ -1533,10 +1534,52 @@ async function handleDeploy(
 ): Promise<void> {
   const actor = userId ? `<@${userId}>` : 'someone';
 
+  // ── Pre-deploy analysis ────────────────────────────────────────────────────
   const ts = await post(client, channel, threadTs,
-    `🔨 Building \`${repo}\` from \`${branch}\`...`,
-    statusBlocks({ repo, branch, port, actor, stage: 'building' }),
+    `🔍 Analyzing \`${repo}\` before deploy...`,
   );
+
+  let analysis;
+  try {
+    analysis = await runDeployAnalysis(repo, branch);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ action: 'deploy:analysis_error', repo, err: msg }, 'Analysis threw — proceeding anyway');
+    // Non-fatal: if analysis itself errors, don't block the deploy
+    analysis = { eligible: true, detectedPort: null, blockers: [], warnings: [], claudeCodePrompt: null };
+  }
+
+  // If blockers found — stop here, give developer a fix prompt
+  if (!analysis.eligible && analysis.blockers.length > 0) {
+    const blockerLines = analysis.blockers
+      .map((b, i) => `*${i + 1}. ${b.issue}*\n   _Fix:_ ${b.fix}`)
+      .join('\n\n');
+
+    const promptBlock = analysis.claudeCodePrompt
+      ? `\n\n*Fix it with Claude Code — paste this into your terminal inside the \`${repo}\` repo:*\n\`\`\`\nclaud -p "${analysis.claudeCodePrompt.replace(/"/g, '\\"')}"\n\`\`\``
+      : '';
+
+    const msg = `❌ *\`${repo}\` is not ready to deploy* — ${analysis.blockers.length} blocker(s) found:\n\n${blockerLines}${promptBlock}\n\n_Fix the issues above, then ask me to deploy again._`;
+    await update(client, channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return;
+  }
+
+  // Use port from Dockerfile EXPOSE if Claude guessed wrong
+  const resolvedPort = analysis.detectedPort ?? port;
+
+  // Surface any warnings, then proceed
+  const warningText = analysis.warnings.length > 0
+    ? `\n⚠️ *Warnings:* ${analysis.warnings.map((w) => w.issue).join(' · ')}`
+    : '';
+
+  await update(client, channel, ts,
+    `✓ Analysis passed.${warningText}\n🔨 Building \`${repo}\` from \`${branch}\`...`,
+    statusBlocks({ repo, branch, port: resolvedPort, actor, stage: 'building' }),
+  );
+
+  // Shadow-replace port with the detected value for the rest of the deploy
+  port = resolvedPort;
 
   // ── Build ──────────────────────────────────────────────────────────────────
   let imageUri: string;

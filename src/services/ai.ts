@@ -1408,6 +1408,141 @@ export async function generateCodeFix(
   }
 }
 
+// ─── Pre-deploy repo analysis ─────────────────────────────────────────────────
+
+export interface DeployBlocker {
+  issue: string;
+  fix: string;
+}
+
+export interface DeployWarning {
+  issue: string;
+  suggestion: string;
+}
+
+export interface DeployAnalysis {
+  eligible: boolean;
+  detectedPort: number | null;
+  blockers: DeployBlocker[];
+  warnings: DeployWarning[];
+  /** Ready-to-paste Claude Code prompt. null when eligible. */
+  claudeCodePrompt: string | null;
+}
+
+/**
+ * Run a structured eligibility check on a repo before deploying.
+ * Returns blockers (hard stops), warnings (noted but not blocking),
+ * the detected port, and a copy-paste Claude Code prompt when blockers exist.
+ */
+export async function analyzeDeployEligibility(
+  repo: string,
+  repoData: {
+    files: string[];
+    dockerfile: string | null;
+    exposedPort: number | null;
+    packageJson: string | null;
+    requirementsTxt: string | null;
+    readme: string | null;
+    envExample: string | null;
+    dockerCompose: string | null;
+    claudeMd: string | null;
+    entryPoint: string | null;
+  },
+): Promise<DeployAnalysis> {
+  logger.info({ action: 'ai:analyze_deploy', repo }, 'Analyzing repo deploy eligibility');
+
+  const dataSection = [
+    `REPO: ${repo}`,
+    `TOP-LEVEL FILES: ${repoData.files.join(', ')}`,
+    repoData.dockerfile      ? `\nDOCKERFILE:\n${repoData.dockerfile}`               : '\nDOCKERFILE: (not found)',
+    repoData.packageJson     ? `\nPACKAGE.JSON:\n${repoData.packageJson}`             : '',
+    repoData.requirementsTxt ? `\nREQUIREMENTS.TXT:\n${repoData.requirementsTxt}`     : '',
+    repoData.envExample      ? `\n.ENV.EXAMPLE:\n${repoData.envExample}`              : '',
+    repoData.dockerCompose   ? `\nDOCKER-COMPOSE.YML:\n${repoData.dockerCompose}`     : '',
+    repoData.claudeMd        ? `\nCLAUDE.MD:\n${repoData.claudeMd}`                   : '',
+    repoData.readme          ? `\nREADME (first 1500 chars):\n${repoData.readme.slice(0, 1500)}` : '',
+    repoData.entryPoint      ? `\nMAIN ENTRY POINT (first 2000 chars):\n${repoData.entryPoint.slice(0, 2000)}` : '',
+  ].filter(Boolean).join('\n');
+
+  const systemPrompt = `You are a DevOps readiness checker for AWS ECS Fargate deployments via Tangent.
+
+TANGENT'S DEPLOYMENT MODEL (know this cold):
+- Docker build → push to ECR → ECS Fargate task (two containers: app + ngrok sidecar)
+- Fargate = NO persistent disk, NO filesystem mounts, NO docker-compose sidecars in prod
+- Every app container automatically receives: DB_HOST=10.40.40.123, DB_PORT=5432 as plain env vars
+- Secrets (passwords, tokens, API keys) come from AWS Secrets Manager injected as individual env vars
+  (e.g. DB_PASSWORD, SLACK_BOT_TOKEN, ANTHROPIC_API_KEY — NOT as files, NOT as volumes)
+- ANTHROPIC_API_KEY is injected automatically into every container
+- ngrok tunnel handles all inbound HTTP traffic
+- The app MUST bind to 0.0.0.0 (not 127.0.0.1 / localhost)
+
+BLOCKERS — set eligible=false if ANY of these are present:
+1. No Dockerfile in the repo
+2. Dockerfile has no CMD and no ENTRYPOINT
+3. App server binds only to 127.0.0.1 or localhost (not 0.0.0.0)
+4. File-path credentials: GOOGLE_APPLICATION_CREDENTIALS or similar set to a JSON file path
+5. Hard-coded localhost service URLs (DB, Redis, etc.) that aren't read from env vars
+
+WARNINGS — eligible=true but surface these:
+1. DATABASE_URL composite string (works if injected as a secret but DB_HOST/DB_PORT/DB_PASSWORD is preferred)
+2. docker-compose.yml defines services (redis, postgres, mongo, etc.) that won't run in ECS
+3. EXPOSE missing from Dockerfile (Tangent will have to guess the port)
+4. Env vars in .env.example that Tangent can't provide automatically (non-DB, non-Anthropic secrets)
+
+OUTPUT: Return ONLY valid JSON, no markdown fences, matching exactly this schema:
+{
+  "eligible": boolean,
+  "detectedPort": number | null,
+  "blockers": [{ "issue": "concise description", "fix": "specific fix with file names + what to change" }],
+  "warnings": [{ "issue": "concise description", "suggestion": "what to do about it" }],
+  "claudeCodePrompt": string | null
+}
+
+claudeCodePrompt rules (when eligible=false):
+- Write it as if you are briefing a developer who will paste it into Claude Code inside the repo
+- Start with: "Fix this repo for AWS ECS Fargate deployment via Tangent."
+- List each blocker with the specific file, the problem, and the exact code change needed
+- Mention Tangent's automatic env vars: DB_HOST=10.40.40.123, DB_PORT=5432, DB_PASSWORD (injected via Tangent), ANTHROPIC_API_KEY (auto-injected)
+- End with: "Once fixed, ask Tangent in Slack to deploy again."
+- Keep it under 400 words, very actionable
+- When eligible=true, set claudeCodePrompt to null`;
+
+  try {
+    const response = await withRetry(() => client().messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1500,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: dataSection }],
+    }), 'analyzeDeployEligibility');
+
+    const block = response.content.find((b) => b.type === 'text');
+    const raw = block?.type === 'text' ? block.text.trim() : '';
+
+    // Strip any accidental markdown fences
+    const json = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    const parsed = JSON.parse(json) as DeployAnalysis;
+
+    // Normalise fields so callers can always trust the shape
+    return {
+      eligible:         Boolean(parsed.eligible),
+      detectedPort:     parsed.detectedPort != null ? Number(parsed.detectedPort) : null,
+      blockers:         Array.isArray(parsed.blockers)  ? parsed.blockers  : [],
+      warnings:         Array.isArray(parsed.warnings)  ? parsed.warnings  : [],
+      claudeCodePrompt: parsed.claudeCodePrompt ?? null,
+    };
+  } catch (err) {
+    logger.error({ action: 'ai:analyze_deploy:failed', err }, 'Deploy analysis failed — allowing deploy to proceed');
+    // If the analysis itself crashes, don't block the deploy — fail open.
+    return {
+      eligible:         true,
+      detectedPort:     repoData.exposedPort,
+      blockers:         [],
+      warnings:         [{ issue: 'Pre-deploy analysis failed', suggestion: 'Check logs; deploy proceeding anyway.' }],
+      claudeCodePrompt: null,
+    };
+  }
+}
+
 // ─── Error summarizers (used by build.ts and deploy flow) ────────────────────
 
 /**
