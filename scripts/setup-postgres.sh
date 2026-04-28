@@ -69,13 +69,16 @@ QUERY_PW=$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 32)
 
 echo "→ Creating roles tangent_admin, tangent_query..."
 sudo -u postgres psql <<EOF
--- tangent_admin: can create roles and databases, but is NOT a superuser.
--- This is enough for Tangent's create_user / drop_user / create_db tools.
+-- tangent_admin: SUPERUSER. Tangent runs on the same EC2 as Postgres
+-- and Daanish wants it to have complete access — full read/write across
+-- every database, schema management, extension installation, role
+-- management.  Defense in depth comes from the Daanish-only gate on
+-- destructive tools, not from a privilege fence on tangent_admin itself.
 DO \$\$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'tangent_admin') THEN
-    CREATE ROLE tangent_admin WITH LOGIN CREATEROLE CREATEDB PASSWORD '${ADMIN_PW}';
+    CREATE ROLE tangent_admin WITH LOGIN SUPERUSER CREATEROLE CREATEDB PASSWORD '${ADMIN_PW}';
   ELSE
-    ALTER ROLE tangent_admin WITH LOGIN CREATEROLE CREATEDB PASSWORD '${ADMIN_PW}';
+    ALTER ROLE tangent_admin WITH LOGIN SUPERUSER CREATEROLE CREATEDB PASSWORD '${ADMIN_PW}';
   END IF;
 END \$\$;
 

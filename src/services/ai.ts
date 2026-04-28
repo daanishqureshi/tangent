@@ -49,7 +49,8 @@ export type AgentToolCall =
   | { name: 'db_query';         input: { sql: string } }
   | { name: 'db_list_users';    input: Record<string, never> }
   | { name: 'db_create_user';   input: { username: string; create_database?: boolean } }
-  | { name: 'db_drop_user';     input: { username: string; drop_database?: boolean } };
+  | { name: 'db_drop_user';     input: { username: string; drop_database?: boolean } }
+  | { name: 'bash';             input: { command: string; reason: string; timeout_seconds?: number } };
 
 export type AgentResponse =
   | { type: 'tool'; call: AgentToolCall }
@@ -519,6 +520,29 @@ const TOOLS: Anthropic.Tool[] = [
       required: ['username'],
     },
   },
+  {
+    name: 'bash',
+    description:
+      'Execute a bash command on the Tangent EC2 (10.40.40.123) — the same host Tangent runs on. ' +
+      '*ONLY Daanish (U07EU7KSG3U) can call this, and ONLY in a DM with Tangent.* ' +
+      'Every invocation triggers a confirmation prompt that shows Daanish the exact command before it runs — Daanish must reply "yes" to execute. ' +
+      'Use this for ops tasks that previously required SSH: editing /etc/postgresql/15/main/pg_hba.conf, reloading services (e.g. `sudo -u postgres psql -c "SELECT pg_reload_conf();"`), inspecting disk usage, tailing /var/log files, running pg_dump, checking systemd unit status, etc. ' +
+      'Tangent runs as user `ubuntu` which has passwordless `sudo` on this AMI — `sudo` works in any command. ' +
+      'Hard caps: 60s timeout (default; max 600s), 8KB stdout/stderr cap each, no interactive input, no shell pipes are special — the command is passed to `bash -c`. ' +
+      'You MUST include a short `reason` field explaining what the command is supposed to accomplish so the confirmation prompt is human-readable. ' +
+      'Do NOT use this to modify Tangent\'s OWN source code (use edit_self / push_self / read_self). ' +
+      'Do NOT use this to bypass other gated tools (e.g. running `aws ecs ...` to deploy when there is a deploy tool, or `psql` to drop a role when there is a db_drop_user tool). Each existing tool is the canonical path for its action. ' +
+      'Do NOT use this for tasks that don\'t require host access (file reads in repos → use read_file; secret listing → use list_secrets).',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        command: { type: 'string', description: 'The bash command to execute (passed to `bash -c`). Can include pipes, redirects, sudo, etc.' },
+        reason:  { type: 'string', description: 'A short human-readable explanation of what this command does and why you are running it. Shown verbatim in the confirmation prompt to Daanish.' },
+        timeout_seconds: { type: 'number', description: 'Optional override for the 60s default timeout. Max 600.' },
+      },
+      required: ['command', 'reason'],
+    },
+  },
 ];
 
 // ─── System prompt ────────────────────────────────────────────────────────────
@@ -636,6 +660,23 @@ Once you have the ID, you know exactly who it is. Greet them by name. Never ask 
 - *Per-service connection injection:* after \`db_create_user\` posts the connection string, Daanish can wire it into a deployed service by saving it to Secrets Manager with \`put_secret\` (auto-prefixed to \`tangent/...\`) and then \`inject_secret\` into the target repo. The env var name should match what the service expects (commonly \`DATABASE_URL\`).
 - *Dropping users (Daanish-only):* \`db_drop_user\` is destructive and not reversible. Always confirm with Daanish in the same message before invoking, even though Daanish is the only one who can call it.
 - *Refusal pattern:* if a non-Daanish user asks you to create or drop a DB user, refuse politely and tell them to ping Daanish.
+
+*Bash on the host (Daanish-only, DM-only — high-risk tool, read carefully):*
+- You CAN execute bash commands directly on the Tangent EC2 (10.40.40.123). You run on this same host, so SSH is unnecessary for ops tasks like editing pg_hba.conf, reloading services, tailing /var/log, running pg_dump, checking systemd, etc.
+- HARD GATES — the \`bash\` tool will refuse to run unless ALL of these are true:
+  1. The caller is Daanish (U07EU7KSG3U). For anyone else, refuse politely and tell them to ping Daanish.
+  2. The conversation is a DM with you (not a public/private channel, not a thread). For channel requests, ask Daanish to DM you instead.
+  3. Daanish replies "yes" to the confirmation prompt that shows the exact command. (This part is enforced in code; you don't need to re-prompt yourself.)
+- WHEN to use bash: edit \`/etc/postgresql/*/main/pg_hba.conf\`, run \`sudo -u postgres psql -c "SELECT pg_reload_conf();"\`, \`sudo systemctl status\`, \`df -h\`, \`tail -n 200 /var/log/...\`, \`pg_dump\`, \`sudo apt-get install ...\` (after explicit Daanish confirmation), \`pm2 logs\`, etc.
+- WHEN NOT to use bash:
+  - Don't use it to modify Tangent's own source — use \`edit_self\` / \`push_self\` / \`read_self\` so the change goes through git history.
+  - Don't use it to bypass other tools — if there's a structured tool for the action (\`deploy\`, \`db_drop_user\`, \`inject_secret\`, etc.), use that. The structured tool has gates and audit trails this tool doesn't.
+  - Don't use it to inspect repo files — use \`read_file\` so the LLM can read the file content cleanly.
+  - Don't use it for routine reads when a dedicated tool exists (status, list_services, list_secrets, db_schema, db_query).
+- Always include a short \`reason\` explaining what the command does — that text is shown to Daanish verbatim on the confirmation prompt, so make it informative.
+- Tangent runs as user \`ubuntu\`, which has passwordless \`sudo\`. \`sudo\` works for any command. Be deliberate.
+- The tool returns stdout, stderr, and exit code (truncated to 8KB each). If you need MORE output, narrow with \`grep\`/\`tail\`/\`wc -l\` — don't ask Daanish to redo the call.
+- Default timeout is 60s; bump up to 600s for slow ops like \`pg_dump\` of a large database. Don't go higher than you need.
 
 *Self-editing — you can modify your OWN source code:*
 - There are four special tools — \`read_self\`, \`list_self_commits\`, \`edit_self\`, \`push_self\` — that target *Tangent's own* GitHub repository (the code that runs you).
@@ -972,6 +1013,17 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
         username:      String(raw['username'] ?? ''),
         drop_database: raw['drop_database'] === true,
       }};
+    case 'bash': {
+      const command = String(raw['command'] ?? '').trim();
+      const reason  = String(raw['reason']  ?? '').trim();
+      if (!command) throw new ToolCallValidationError('bash: `command` is required and must be non-empty');
+      if (!reason)  throw new ToolCallValidationError('bash: `reason` is required — describe what this command does so the confirmation prompt is human-readable');
+      // Cap timeout at 600s; default 60s.
+      let timeoutSeconds = raw['timeout_seconds'] !== undefined ? Number(raw['timeout_seconds']) : 60;
+      if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) timeoutSeconds = 60;
+      if (timeoutSeconds > 600) timeoutSeconds = 600;
+      return { name: 'bash', input: { command, reason, timeout_seconds: timeoutSeconds } };
+    }
     default:
       logger.warn({ action: 'ai:unknown_tool', name }, 'Claude called an unknown tool');
       return null;

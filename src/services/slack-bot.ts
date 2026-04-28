@@ -631,6 +631,40 @@ async function _routeInner(
     return;
   }
 
+  if (call.name === 'bash') {
+    // ── Triple gate: Daanish-only + DM-only + confirmation prompt ─────────
+    if (ctx.userId !== APPROVER_ID) {
+      const msg = '🔒 Only Daanish can run shell commands on the Tangent host.';
+      await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+      _appendTurn(convKey, { role: 'assistant', content: msg });
+      return;
+    }
+    if (source !== 'dm') {
+      const msg = '🔒 The `bash` tool only works in a DM with me — not in channels or threads. DM me directly and we can run it there.';
+      await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+      _appendTurn(convKey, { role: 'assistant', content: msg });
+      return;
+    }
+
+    const { command, reason, timeout_seconds } = call.input as { command: string; reason: string; timeout_seconds?: number };
+    const timeoutS = timeout_seconds ?? 60;
+    const prompt = [
+      `🖥️ *About to run a shell command on the Tangent EC2 (10.40.40.123)*`,
+      `*Reason:* ${reason}`,
+      `*Timeout:* ${timeoutS}s`,
+      '',
+      '```',
+      command,
+      '```',
+      '',
+      'Reply *yes* to execute or *no* to cancel.',
+    ].join('\n');
+    _setPending(convKey, call, prompt, APPROVER_ID, ctx.userId);
+    await post(ctx.client, ctx.channel, ctx.threadTs, prompt);
+    _appendTurn(convKey, { role: 'assistant', content: prompt });
+    return;
+  }
+
   // Await tool execution so the per-conversation processing lock (held by
   // route()) stays active until the full tool chain completes.  Without this,
   // impatient follow-up messages spawn concurrent processMessage calls that
@@ -741,6 +775,11 @@ async function executeToolCall(
     }
     case 'db_drop_user': {
       const result = await handleDbDropUser(ctx, call.input as { username: string; drop_database?: boolean }, convKey);
+      await _chainIfNeeded(call, result, ctx, convKey, userMessage, history);
+      break;
+    }
+    case 'bash': {
+      const result = await handleBash(ctx, call.input as { command: string; reason: string; timeout_seconds?: number }, convKey);
       await _chainIfNeeded(call, result, ctx, convKey, userMessage, history);
       break;
     }
@@ -2320,6 +2359,160 @@ async function handleDbDropUser(
     _appendTurn(convKey, { role: 'assistant', content: msg });
     return msg;
   }
+}
+
+/**
+ * Execute a bash command on the Tangent host.
+ *
+ * Defense in depth:
+ *   1. Daanish-only check (also enforced upstream in route())
+ *   2. DM-only check (also enforced upstream)
+ *   3. Confirmation gate already passed by the time we get here (route()
+ *      sets _setPending; the consent classifier dispatches us only after
+ *      Daanish replies "yes")
+ *
+ * Hard caps: 60s default timeout (max 600s), 8KB stdout/stderr each, no
+ * stdin.  Audit-logs every invocation with the user ID, command, exit
+ * code, duration, and truncated output.
+ */
+async function handleBash(
+  ctx: Ctx,
+  input: { command: string; reason: string; timeout_seconds?: number },
+  convKey: string,
+): Promise<string> {
+  // Belt-and-suspenders gates. The route()-level gates SHOULD have caught
+  // this already, but the cost of an extra check vs. accidentally executing
+  // an unauthorised shell command is asymmetric — keep them.
+  if (ctx.userId !== APPROVER_ID) {
+    const msg = '🔒 bash tool refused — caller is not Daanish.';
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  }
+
+  const { command, reason } = input;
+  const timeoutMs = Math.min(Math.max(input.timeout_seconds ?? 60, 1), 600) * 1000;
+  const OUTPUT_CAP = 8 * 1024;
+
+  const started = Date.now();
+  const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Running: \`${command.length > 80 ? command.slice(0, 77) + '...' : command}\``);
+
+  const { spawn } = await import('child_process');
+
+  // Audit log BEFORE execution — so even if the process explodes mid-run we
+  // have a record of what was attempted and by whom.
+  logger.info(
+    { action: 'bash:exec', userId: ctx.userId, command, reason, timeoutMs },
+    'Executing bash command',
+  );
+
+  const result = await new Promise<{ stdout: string; stderr: string; exitCode: number | null; signal: NodeJS.Signals | null; timedOut: boolean }>((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let timedOut = false;
+
+    const child = spawn('bash', ['-c', command], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // Run from /home/ubuntu/tangent so relative paths feel natural
+      cwd: process.cwd(),
+    });
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (stdoutTruncated) return;
+      const remaining = OUTPUT_CAP - stdout.length;
+      if (chunk.length > remaining) {
+        stdout += chunk.slice(0, remaining).toString('utf8');
+        stdoutTruncated = true;
+      } else {
+        stdout += chunk.toString('utf8');
+      }
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (stderrTruncated) return;
+      const remaining = OUTPUT_CAP - stderr.length;
+      if (chunk.length > remaining) {
+        stderr += chunk.slice(0, remaining).toString('utf8');
+        stderrTruncated = true;
+      } else {
+        stderr += chunk.toString('utf8');
+      }
+    });
+
+    const killer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, timeoutMs);
+
+    child.on('close', (exitCode, signal) => {
+      clearTimeout(killer);
+      if (stdoutTruncated) stdout += '\n…[truncated at 8KB]';
+      if (stderrTruncated) stderr += '\n…[truncated at 8KB]';
+      resolve({ stdout, stderr, exitCode, signal, timedOut });
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(killer);
+      resolve({ stdout, stderr: stderr + `\nspawn error: ${err.message}`, exitCode: null, signal: null, timedOut });
+    });
+  });
+
+  const durationMs = Date.now() - started;
+
+  // Audit log AFTER execution
+  logger.info(
+    {
+      action: 'bash:done',
+      userId: ctx.userId,
+      command,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      durationMs,
+      stdoutBytes: result.stdout.length,
+      stderrBytes: result.stderr.length,
+    },
+    'Bash command finished',
+  );
+
+  // Build a user-facing reply.  Show stdout / stderr / exit code, and put
+  // long output in code fences for readability.
+  const lines: string[] = [];
+  if (result.timedOut) {
+    lines.push(`⏱️ *Timed out* after ${timeoutMs / 1000}s — process killed with SIGKILL.`);
+  } else if (result.exitCode === 0) {
+    lines.push(`✅ Exit 0 (${durationMs}ms)`);
+  } else {
+    lines.push(`❌ Exit ${result.exitCode ?? 'null'}${result.signal ? ` (signal ${result.signal})` : ''} — ${durationMs}ms`);
+  }
+
+  if (result.stdout.trim()) {
+    lines.push('', '*stdout:*', '```', result.stdout, '```');
+  }
+  if (result.stderr.trim()) {
+    lines.push('', '*stderr:*', '```', result.stderr, '```');
+  }
+  if (!result.stdout.trim() && !result.stderr.trim()) {
+    lines.push('_(no output)_');
+  }
+
+  const reply = lines.join('\n');
+  await update(ctx.client, ctx.channel, ts, reply);
+  _appendTurn(convKey, { role: 'assistant', content: reply });
+
+  // Return value for the chain — give Claude a structured result so it can
+  // narrate / decide next steps in plain language.
+  return [
+    `bash command result:`,
+    `command: ${command}`,
+    `reason: ${reason}`,
+    `exit_code: ${result.exitCode}${result.signal ? ` (signal ${result.signal})` : ''}`,
+    `timed_out: ${result.timedOut}`,
+    `duration_ms: ${durationMs}`,
+    `stdout:\n${result.stdout || '(empty)'}`,
+    `stderr:\n${result.stderr || '(empty)'}`,
+  ].join('\n');
 }
 
 async function handleRememberPerson(
