@@ -727,6 +727,23 @@ async function executeToolCall(
       if (!ensureSelfEditAllowed(ctx, convKey)) break;
       await handleSelfPush(ctx, call.input as { path: string; content: string; message?: string }, convKey);
       break;
+    // ─── Postgres tools ────────────────────────────────────────────────
+    case 'db_schema':
+    case 'db_query':
+    case 'db_list_users':
+      // All read-only — handleInfoTool synthesises a conversational reply
+      await handleInfoTool(call, ctx, convKey, userMessage, history);
+      break;
+    case 'db_create_user': {
+      const result = await handleDbCreateUser(ctx, call.input as { username: string; create_database?: boolean }, convKey);
+      await _chainIfNeeded(call, result, ctx, convKey, userMessage, history);
+      break;
+    }
+    case 'db_drop_user': {
+      const result = await handleDbDropUser(ctx, call.input as { username: string; drop_database?: boolean }, convKey);
+      await _chainIfNeeded(call, result, ctx, convKey, userMessage, history);
+      break;
+    }
     default:
       // Informational tools: fetch data, synthesize a conversational response via Claude
       await handleInfoTool(call, ctx, convKey, userMessage, history);
@@ -1211,6 +1228,12 @@ async function fetchToolData(call: AgentToolCall): Promise<string> {
       const header = path ? `Tangent commits touching \`${path}\`:` : `Recent Tangent commits:`;
       return `${header}\n${lines.join('\n')}`;
     }
+    case 'db_schema':
+      return fetchDbSchema();
+    case 'db_query':
+      return fetchDbQuery((call.input as { sql: string }).sql);
+    case 'db_list_users':
+      return fetchDbListUsers();
     default:
       return `Unknown tool: ${call.name}`;
   }
@@ -2030,6 +2053,229 @@ async function handlePutSecret(
     const result = `Failed to save secret "${input.name}": ${err instanceof Error ? err.message : String(err)}`;
     await update(ctx.client, ctx.channel, ts, `❌ ${result}`);
     return result;
+  }
+}
+
+// ─── Postgres tool handlers ──────────────────────────────────────────────────
+
+async function fetchDbSchema(): Promise<string> {
+  const { pgConfigured, describeSchema } = await import('./postgres.js');
+  if (!pgConfigured()) return 'Postgres is not configured on this Tangent instance — run scripts/setup-postgres.sh on the EC2 first, then add TANGENT_DB_ADMIN_URL and TANGENT_DB_QUERY_URL to .env.';
+
+  const s = await describeSchema();
+  const parts: string[] = [];
+  parts.push(`Databases: ${s.databases.join(', ') || '(none)'}`);
+  parts.push(`Extensions: ${s.extensions.map((e) => `${e.name}@${e.version}`).join(', ') || '(none)'}`);
+  if (s.tables.length === 0) {
+    parts.push('Tables: (none — schema is empty)');
+  } else {
+    parts.push(`Tables (${s.tables.length}):`);
+    for (const t of s.tables) {
+      parts.push(`  ${t.schema}.${t.name} (~${t.rowEstimate} rows)`);
+    }
+  }
+  if (s.columns.length > 0) {
+    parts.push(`\nColumns:`);
+    let lastTable = '';
+    for (const c of s.columns) {
+      const fq = `${c.schema}.${c.table}`;
+      if (fq !== lastTable) {
+        parts.push(`  ${fq}:`);
+        lastTable = fq;
+      }
+      parts.push(`    ${c.column}: ${c.type}${c.nullable ? ' (nullable)' : ''}`);
+    }
+  }
+  return parts.join('\n');
+}
+
+async function fetchDbQuery(sql: string): Promise<string> {
+  const { pgConfigured, runReadOnlyQuery, validateReadOnlySql } = await import('./postgres.js');
+  if (!pgConfigured()) return 'Postgres is not configured on this Tangent instance.';
+
+  const validation = validateReadOnlySql(sql);
+  if (!validation.ok) return `Query rejected: ${validation.reason}\n\nThe db_query tool only allows read-only statements (SELECT, WITH, EXPLAIN, SHOW, VALUES, TABLE).`;
+
+  try {
+    const result = await runReadOnlyQuery(sql);
+    if (result.rowCount === 0) return `Query returned 0 rows.\n\nSQL:\n\`\`\`sql\n${sql}\n\`\`\``;
+
+    // Format as a markdown-ish table
+    const colNames = result.fields.map((f) => f.name);
+    const rows = result.rows.map((r) =>
+      colNames.map((c) => {
+        const v = r[c];
+        if (v === null || v === undefined) return '∅';
+        if (typeof v === 'object') return JSON.stringify(v);
+        return String(v);
+      }),
+    );
+    const lines: string[] = [];
+    lines.push(colNames.join(' | '));
+    lines.push(colNames.map(() => '---').join(' | '));
+    for (const r of rows) lines.push(r.map((cell) => cell.length > 80 ? cell.slice(0, 77) + '...' : cell).join(' | '));
+
+    const truncNote = result.truncated ? `\n\n_(truncated to first 50 rows of ${result.rowCount} total)_` : '';
+    return `Query returned ${result.rowCount} row(s):\n\`\`\`\n${lines.join('\n')}\n\`\`\`${truncNote}`;
+  } catch (err) {
+    return `Query failed: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+async function fetchDbListUsers(): Promise<string> {
+  const { pgConfigured, listDbUsers } = await import('./postgres.js');
+  if (!pgConfigured()) return 'Postgres is not configured on this Tangent instance.';
+
+  const users = await listDbUsers();
+  if (users.length === 0) return 'No Postgres roles found (excluding internal pg_* roles).';
+
+  const lines = users.map((u) => {
+    const flags: string[] = [];
+    if (u.rolsuper) flags.push('SUPERUSER');
+    if (u.rolcreaterole) flags.push('CREATEROLE');
+    if (u.rolcreatedb) flags.push('CREATEDB');
+    if (!u.rolcanlogin) flags.push('NOLOGIN');
+    return `- *${u.rolname}*${flags.length > 0 ? ` _(${flags.join(', ')})_` : ''}`;
+  });
+  return `${users.length} Postgres role(s):\n${lines.join('\n')}`;
+}
+
+async function handleDbCreateUser(
+  ctx: Ctx,
+  input: { username: string; create_database?: boolean },
+  convKey: string,
+): Promise<string> {
+  // Daanish only — Postgres role creation is high blast radius
+  if (ctx.userId !== APPROVER_ID) {
+    const msg = '🔒 Only Daanish can create Postgres users — DB role names are sensitive and the password gets DM\'d to him.';
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  }
+
+  const { pgConfigured, createDbUser, validateRoleName } = await import('./postgres.js');
+  if (!pgConfigured()) {
+    const msg = 'Postgres is not configured on this Tangent instance.';
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    return msg;
+  }
+
+  if (!validateRoleName(input.username)) {
+    const msg = `❌ Invalid role name "${input.username}" — must be lowercase alphanumeric+underscore, 2-63 chars, starting with a letter.`;
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  }
+
+  const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Creating Postgres role \`${input.username}\`...`);
+
+  let result;
+  try {
+    result = await createDbUser({ username: input.username, createDatabase: input.create_database === true });
+  } catch (err) {
+    const msg = `❌ Failed to create role: ${err instanceof Error ? err.message : String(err)}`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  }
+
+  // Mirror the connection string into Secrets Manager so deployed services can inject it.
+  const secretName = `tangent/db/${result.username}`;
+  let secretSaved = false;
+  try {
+    const { CreateSecretCommand, PutSecretValueCommand, ResourceExistsException } = await import('@aws-sdk/client-secrets-manager');
+    const { smClient } = await import('./aws.js');
+    try {
+      await smClient().send(new CreateSecretCommand({
+        Name: secretName,
+        SecretString: result.connectionString,
+        Description: `Postgres connection string for role ${result.username}`,
+      }));
+    } catch (err) {
+      if (err instanceof ResourceExistsException || (err as { name?: string }).name === 'ResourceExistsException') {
+        await smClient().send(new PutSecretValueCommand({
+          SecretId: secretName,
+          SecretString: result.connectionString,
+        }));
+      } else {
+        throw err;
+      }
+    }
+    secretSaved = true;
+  } catch (err) {
+    logger.warn({ action: 'db_create_user:secret_save_failed', err: String(err) }, 'Could not mirror connection string to Secrets Manager');
+  }
+
+  // Public ack — never includes the password
+  const publicMsg = result.databaseName
+    ? `✅ Created role \`${result.username}\` and database \`${result.databaseName}\`. Connection string saved to Secrets Manager as \`${secretName}\`${secretSaved ? '' : ' (⚠️  Secrets Manager save failed — see logs)'}.\nPassword DM'd to <@${APPROVER_ID}>.`
+    : `✅ Created role \`${result.username}\`. Connection string saved to Secrets Manager as \`${secretName}\`${secretSaved ? '' : ' (⚠️  Secrets Manager save failed — see logs)'}.\nPassword DM'd to <@${APPROVER_ID}>.`;
+  await update(ctx.client, ctx.channel, ts, publicMsg);
+  _appendTurn(convKey, { role: 'assistant', content: publicMsg });
+
+  // DM the password to Daanish — ONLY place the password is ever surfaced.
+  try {
+    const dm = await ctx.client.conversations.open({ users: APPROVER_ID });
+    const dmChannel = (dm.channel as { id?: string } | undefined)?.id;
+    if (dmChannel) {
+      const dmText = [
+        `:key: *Postgres role created: \`${result.username}\`*`,
+        result.databaseName ? `Database: \`${result.databaseName}\`` : '',
+        `Password: \`${result.password}\``,
+        `Connection string: \`${result.connectionString}\``,
+        secretSaved ? `Also stored in Secrets Manager as \`${secretName}\` — inject it via \`@Tangent inject ${secretName} into <repo>\`.` : '⚠️  *Secrets Manager save failed* — store this string somewhere safe.',
+        '',
+        '_This password is shown only once. The Secrets Manager copy is the source of truth going forward._',
+      ].filter(Boolean).join('\n');
+      await ctx.client.chat.postMessage({ channel: dmChannel, text: dmText });
+    } else {
+      logger.warn({ action: 'db_create_user:dm_open_failed' }, 'Could not open DM with Daanish to deliver password');
+    }
+  } catch (err) {
+    logger.warn({ action: 'db_create_user:dm_send_failed', err: String(err) }, 'Failed to DM password to Daanish');
+  }
+
+  return `Created Postgres role ${result.username}${result.databaseName ? ` and database ${result.databaseName}` : ''}. Connection string is in Secrets Manager as ${secretName}.`;
+}
+
+async function handleDbDropUser(
+  ctx: Ctx,
+  input: { username: string; drop_database?: boolean },
+  convKey: string,
+): Promise<string> {
+  if (ctx.userId !== APPROVER_ID) {
+    const msg = '🔒 Only Daanish can drop Postgres users.';
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  }
+
+  const { pgConfigured, dropDbUser, validateRoleName } = await import('./postgres.js');
+  if (!pgConfigured()) {
+    const msg = 'Postgres is not configured on this Tangent instance.';
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    return msg;
+  }
+  if (!validateRoleName(input.username)) {
+    const msg = `❌ Invalid role name "${input.username}".`;
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  }
+
+  const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Dropping role \`${input.username}\`${input.drop_database ? ' and its database' : ''}...`);
+
+  try {
+    await dropDbUser(input.username, input.drop_database === true);
+    const msg = `✅ Dropped role \`${input.username}\`${input.drop_database ? ' and its database' : ''}.`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  } catch (err) {
+    const msg = `❌ Failed to drop role: ${err instanceof Error ? err.message : String(err)}`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
   }
 }
 

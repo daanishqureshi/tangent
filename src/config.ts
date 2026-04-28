@@ -73,6 +73,15 @@ export interface Config {
   selfOwner: string;
   selfRepo: string;
 
+  // Postgres (hosted on the Tangent EC2 — see scripts/setup-postgres.sh)
+  // adminUrl runs as `tangent_admin` (CREATEROLE, CREATEDB) — used by the
+  //   Daanish-only db_create_user / db_drop_user tools.
+  // queryUrl runs as `tangent_query` (read-only)               — used by the
+  //   any-user db_query tool.  Empty string = Postgres tools disabled.
+  pgAdminUrl: string;
+  pgQueryUrl: string;
+  pgHostInternalIp: string; // for building per-service connection strings
+
   // Server
   port: number;
   host: string;
@@ -236,6 +245,12 @@ export async function loadConfig(): Promise<Config> {
   const selfOwner = optionalEnv('TANGENT_SELF_OWNER', 'daanishqureshi');
   const selfRepo  = optionalEnv('TANGENT_SELF_REPO',  'tangent');
 
+  // Postgres connection strings — empty by default so Postgres tools simply
+  // no-op until setup-postgres.sh has been run on the EC2.
+  const pgAdminUrl       = optionalEnv('TANGENT_DB_ADMIN_URL', '');
+  const pgQueryUrl       = optionalEnv('TANGENT_DB_QUERY_URL', '');
+  const pgHostInternalIp = optionalEnv('TANGENT_DB_HOST_INTERNAL_IP', '10.40.40.123');
+
   const port = parseInt(optionalEnv('PORT', '3000'), 10);
   const host = optionalEnv('HOST', '127.0.0.1');
   const taskCpu = optionalEnv('TASK_CPU', '512');
@@ -309,6 +324,9 @@ export async function loadConfig(): Promise<Config> {
     scaffoldChildTopic,
     selfOwner,
     selfRepo,
+    pgAdminUrl,
+    pgQueryUrl,
+    pgHostInternalIp,
     port,
     host,
     workspaceDir,

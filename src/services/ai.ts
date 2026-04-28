@@ -44,7 +44,12 @@ export type AgentToolCall =
   | { name: 'read_self';        input: { path: string; ref?: string } }
   | { name: 'list_self_commits'; input: { path?: string; limit?: number } }
   | { name: 'edit_self';        input: { path: string; find: string; replace: string; replace_all?: boolean; message?: string } }
-  | { name: 'push_self';        input: { path: string; content: string; message?: string } };
+  | { name: 'push_self';        input: { path: string; content: string; message?: string } }
+  | { name: 'db_schema';        input: Record<string, never> }
+  | { name: 'db_query';         input: { sql: string } }
+  | { name: 'db_list_users';    input: Record<string, never> }
+  | { name: 'db_create_user';   input: { username: string; create_database?: boolean } }
+  | { name: 'db_drop_user';     input: { username: string; drop_database?: boolean } };
 
 export type AgentResponse =
   | { type: 'tool'; call: AgentToolCall }
@@ -437,6 +442,82 @@ const TOOLS: Anthropic.Tool[] = [
       required: ['path', 'content'],
     },
   },
+  // ─── Postgres tools ────────────────────────────────────────────────────
+  // Postgres is hosted on the same EC2 as Tangent. db_schema, db_query, and
+  // db_list_users use the read-only `tangent_query` role and are open to any
+  // authorised user.  db_create_user / db_drop_user are Daanish-only because
+  // they manage Postgres roles (blast radius is the entire cluster).
+  {
+    name: 'db_schema',
+    description:
+      'Describe the Postgres database hosted on the Tangent EC2: list of databases, installed extensions ' +
+      '(including pgvector if enabled), all user-created tables with row-count estimates, and every column ' +
+      'with its type and nullability. Use this whenever someone asks "what tables are in the database", ' +
+      '"what does the schema look like", "is pgvector installed", or before answering questions that require ' +
+      'understanding the data model. Read-only. Open to any authorised user.',
+    input_schema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'db_query',
+    description:
+      'Run a read-only SQL query against the Postgres database. Open to any authorised user. ' +
+      'Connects as the `tangent_query` role which has SELECT-only privileges, AND the SQL is parsed ' +
+      'so anything other than SELECT/WITH/EXPLAIN/SHOW/VALUES/TABLE is rejected before execution. ' +
+      'Results are capped at 50 rows with a 5-second statement timeout. Use this for ad-hoc data ' +
+      'lookups, schema exploration via system catalogs, debugging vector store contents, etc. ' +
+      'NEVER attempt INSERT, UPDATE, DELETE, or any DDL — those will be rejected. ' +
+      'Be mindful that results post in the current Slack thread; for queries that might return PII, ' +
+      'narrow with WHERE clauses or LIMIT before running.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        sql: { type: 'string', description: 'A single SELECT/WITH/EXPLAIN/SHOW/VALUES/TABLE statement. No semicolons separating multiple statements.' },
+      },
+      required: ['sql'],
+    },
+  },
+  {
+    name: 'db_list_users',
+    description:
+      'List every Postgres role on the cluster (excluding internal pg_* roles), with whether each can log in, ' +
+      'is a superuser, has CREATEROLE, or has CREATEDB. Use when someone asks "who has DB access" or before ' +
+      'creating a new user to check for naming collisions. Read-only. Open to any authorised user.',
+    input_schema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'db_create_user',
+    description:
+      'Create a new Postgres role with a randomly-generated 32-character password. ONLY Daanish (U07EU7KSG3U) can call this. ' +
+      'The password is DM\'d to Daanish and also stored in AWS Secrets Manager as `tangent/db/<username>` so it can be ' +
+      'injected into deployed services via inject_secret. ' +
+      'Use when Daanish says "create a db user for X", "give the antigent service a db role", "make a new postgres user named Y". ' +
+      'Set create_database=true to ALSO create a database of the same name owned by the new role — useful when standing up ' +
+      'a fresh service that needs its own isolated database. Default is false (the user gets login access to the default `postgres` database only).',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        username: { type: 'string', description: 'Lowercase alphanumeric+underscore, 2-63 chars, starting with a letter (e.g. "antigent" or "vector_store_dev")' },
+        create_database: { type: 'boolean', description: 'If true, also create a database of the same name owned by the new role. Default false.' },
+      },
+      required: ['username'],
+    },
+  },
+  {
+    name: 'db_drop_user',
+    description:
+      'Drop a Postgres role. ONLY Daanish (U07EU7KSG3U) can call this. ' +
+      'REASSIGNs and DROPs OWNED objects first to avoid leaking orphaned privileges. ' +
+      'Set drop_database=true to also drop a database of the same name. ' +
+      'Use carefully — this is destructive and not reversible. Always confirm with Daanish before invoking.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        username: { type: 'string', description: 'The role name to drop' },
+        drop_database: { type: 'boolean', description: 'If true, also DROP DATABASE of the same name (destructive). Default false.' },
+      },
+      required: ['username'],
+    },
+  },
 ];
 
 // ─── System prompt ────────────────────────────────────────────────────────────
@@ -544,6 +625,16 @@ Once you have the ID, you know exactly who it is. Greet them by name. Never ask 
 - GitHub org: Impiricus-AI
 - Each deployed service gets a unique ngrok tunnel protected by Google OAuth (@impiricus.com only)
 - Defaults: branch = main, port = 8080
+
+*Postgres (hosted on the Tangent EC2):*
+- A shared Postgres 15 instance with the pgvector extension runs on the same EC2 as you. Use it for vector stores, ad-hoc data exploration, and per-service databases.
+- *Schema awareness:* call \`db_schema\` whenever someone asks about the data model, what tables exist, or what extensions are installed. Don't guess — the schema can change over time. \`db_schema\` is cheap and authoritative.
+- *Querying data:* \`db_query\` runs as a read-only role with a 5s timeout and 50-row cap. Open to any authorised user. Only SELECT/WITH/EXPLAIN/SHOW/VALUES/TABLE statements are allowed; anything destructive is rejected. When someone asks "how many rows are in X", "what's in the vector store", "show me the latest entries", reach for \`db_query\`.
+- *Cross-referencing code with DB:* you can read files in any repo with \`read_file\` and combine that with \`db_schema\` / \`db_query\` to answer questions like "does the antigent service use the columns it expects" or "is this migration safe given the current data". Use this proactively when debugging.
+- *Creating users (Daanish-only):* \`db_create_user\` generates a random 32-char password, DM's it to Daanish, and stashes it in Secrets Manager as \`tangent/db/<username>\`. Use this when Daanish wants to give a service its own DB role. Set \`create_database: true\` if the service needs its own isolated database — that's the common case for new services using vector storage.
+- *Per-service connection injection:* after \`db_create_user\` puts the connection string in \`tangent/db/<username>\`, any authorised user can wire it into the service via \`inject_secret({repo, secret_name: "tangent/db/<username>"})\`. The env var inside the container will be \`db/<username>\` after the prefix-stripping rule — Daanish may want to rename via a separate \`put_secret\` if the service expects something specific like \`DATABASE_URL\`.
+- *Dropping users (Daanish-only):* \`db_drop_user\` is destructive and not reversible. Always confirm with Daanish in the same message before invoking, even though Daanish is the only one who can call it.
+- *Refusal pattern:* if a non-Daanish user asks you to create or drop a DB user, refuse politely and tell them to ping Daanish.
 
 *Self-editing — you can modify your OWN source code:*
 - There are four special tools — \`read_self\`, \`list_self_commits\`, \`edit_self\`, \`push_self\` — that target *Tangent's own* GitHub repository (the code that runs you).
@@ -863,6 +954,22 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
         name:        String(raw['name']        ?? ''),
         value:       String(raw['value']       ?? ''),
         description: raw['description'] ? String(raw['description']) : undefined,
+      }};
+    case 'db_schema':
+      return { name: 'db_schema', input: {} as Record<string, never> };
+    case 'db_query':
+      return { name: 'db_query', input: { sql: String(raw['sql'] ?? '') } };
+    case 'db_list_users':
+      return { name: 'db_list_users', input: {} as Record<string, never> };
+    case 'db_create_user':
+      return { name: 'db_create_user', input: {
+        username:        String(raw['username'] ?? ''),
+        create_database: raw['create_database'] === true,
+      }};
+    case 'db_drop_user':
+      return { name: 'db_drop_user', input: {
+        username:      String(raw['username'] ?? ''),
+        drop_database: raw['drop_database'] === true,
       }};
     default:
       logger.warn({ action: 'ai:unknown_tool', name }, 'Claude called an unknown tool');
