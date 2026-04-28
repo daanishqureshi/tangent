@@ -1048,38 +1048,70 @@ export async function synthesizeToolResult(
  * This is what enables multi-step agent loops: after an info tool returns data,
  * Claude can decide to take an action rather than just responding conversationally.
  */
+/**
+ * A completed step in a tool chain — the call Claude requested, and the
+ * result string we got back from executing it.  Used by continueAfterTool
+ * to build a proper tool_use/tool_result message sequence.
+ */
+export interface ToolChainStep {
+  call: AgentToolCall;
+  result: string;
+}
+
 export async function continueAfterTool(
-  call: AgentToolCall,
-  toolResult: string,
+  callOrChain: AgentToolCall | ToolChainStep[],
+  toolResult: string | undefined,
   userMessage: string,
   history: ConversationTurn[],
 ): Promise<AgentResponse> {
-  logger.info({ action: 'ai:continue_after_tool', tool: call.name }, 'Checking for follow-up action');
+  // Normalise to a chain — backwards compatible with the old (call, result)
+  // signature so callers who pass a single completed call still work.
+  const chain: ToolChainStep[] = Array.isArray(callOrChain)
+    ? callOrChain
+    : [{ call: callOrChain, result: toolResult ?? '' }];
+
+  if (chain.length === 0) {
+    throw new Error('continueAfterTool: chain is empty');
+  }
+
+  logger.info(
+    { action: 'ai:continue_after_tool', chain: chain.map((s) => s.call.name) },
+    'Checking for follow-up action',
+  );
+
+  const lastResult = chain[chain.length - 1].result;
 
   try {
-    const toolUseId = `tu_${call.name}`;
-
+    // Build messages: history → user msg → for each chain step,
+    // assistant tool_use → user tool_result.  This is the canonical Claude
+    // tool-use format; sending settled calls as plain text confuses the
+    // model into thinking they haven't been completed yet (which produced
+    // the "Tangent saves the same secret 3 times" loop).
     const messages: Anthropic.MessageParam[] = [
       ...history.map((t) => ({ role: t.role as 'user' | 'assistant', content: t.content })),
       { role: 'user', content: userMessage },
-      {
+    ];
+
+    chain.forEach((step, idx) => {
+      const toolUseId = `tu_${step.call.name}_${idx}`;
+      messages.push({
         role: 'assistant',
         content: [{
           type: 'tool_use' as const,
           id: toolUseId,
-          name: call.name,
-          input: call.input as Record<string, unknown>,
+          name: step.call.name,
+          input: step.call.input as Record<string, unknown>,
         }],
-      },
-      {
+      });
+      messages.push({
         role: 'user',
         content: [{
           type: 'tool_result' as const,
           tool_use_id: toolUseId,
-          content: toolResult,
+          content: step.result,
         }],
-      },
-    ];
+      });
+    });
 
     const response = await withRetry(() => client().messages.create({
       model: 'claude-sonnet-4-6',
@@ -1100,9 +1132,10 @@ export async function continueAfterTool(
           { action: 'ai:continue_after_tool:truncated', tool: toolUseBlock.name },
           'Chained tool call hit max_tokens — refusing partial execution',
         );
+        const lastCallName = chain[chain.length - 1].call.name;
         return {
           type: 'text',
-          text: `I started chaining a \`${toolUseBlock.name}\` after \`${call.name}\` but ran out of room before finishing, so I won't send it — a half-formed call could overwrite a file with the wrong contents. If you wanted a small change to an existing file, use \`edit_file\` (it's a find/replace that runs server-side).`,
+          text: `I started chaining a \`${toolUseBlock.name}\` after \`${lastCallName}\` but ran out of room before finishing, so I won't send it — a half-formed call could overwrite a file with the wrong contents. If you wanted a small change to an existing file, use \`edit_file\` (it's a find/replace that runs server-side).`,
         };
       }
 
@@ -1122,11 +1155,11 @@ export async function continueAfterTool(
     }
 
     const textBlock = response.content.find((b) => b.type === 'text');
-    const reply = textBlock?.type === 'text' ? textBlock.text : toolResult;
+    const reply = textBlock?.type === 'text' ? textBlock.text : lastResult;
     return { type: 'text', text: reply };
   } catch (err) {
     logger.error({ action: 'ai:continue_after_tool:failed', err }, 'continueAfterTool failed');
-    return { type: 'text', text: toolResult };
+    return { type: 'text', text: lastResult };
   }
 }
 

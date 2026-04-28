@@ -20,7 +20,7 @@ import { App, LogLevel } from '@slack/bolt';
 import type { WebClient } from '@slack/web-api';
 import type { KnownBlock } from '@slack/types';
 import { config, allowUser } from '../config.js';
-import { processMessage, continueAfterTool, classifyConsent, diagnoseServiceFailure, identifyFileToFix, generateCodeFix, type ConversationTurn, type AgentToolCall } from './ai.js';
+import { processMessage, continueAfterTool, classifyConsent, diagnoseServiceFailure, identifyFileToFix, generateCodeFix, type ConversationTurn, type AgentToolCall, type ToolChainStep } from './ai.js';
 import { buildSkill, DockerfileNotFoundError, DockerBuildError } from '../skills/build.js';
 import { deploySkill } from '../skills/deploy.js';
 import { tunnelSkill, TunnelTimeoutError } from '../skills/tunnel.js';
@@ -752,13 +752,22 @@ async function executeToolCall(
 }
 
 /**
- * After an action tool completes, check if Claude wants to chain to another
- * tool (e.g. inject 3 secrets in sequence). If Claude responds with text,
- * post it as a conversational reply. If it calls another tool, execute it.
+ * Maximum number of chained tool calls per user message — guards against
+ * Claude getting stuck in a loop or running away on a long chain.
+ */
+const MAX_TOOL_CHAIN_LENGTH = 12;
+
+/**
+ * After an action tool completes, ask Claude what's next.  If Claude wants
+ * another tool (e.g. inject_secret × 5 or put_secret × 11), execute it and
+ * loop. If Claude responds with text, post it.
  *
- * This is the key fix for "Tangent only injects one secret when asked to
- * inject all" — without this, action tools were fire-and-forget with no
- * follow-up call to Claude.
+ * The chain is passed to continueAfterTool as a list of ToolChainStep,
+ * which Claude sees as a proper sequence of tool_use/tool_result message
+ * pairs.  This is what makes the model recognise that prior calls are
+ * SETTLED — without it, the same call kept getting re-issued because
+ * Claude couldn't tell the difference between "result text in history"
+ * and "still pending".
  */
 async function _chainIfNeeded(
   completedCall: AgentToolCall,
@@ -768,33 +777,107 @@ async function _chainIfNeeded(
   userMessage: string,
   history: ConversationTurn[],
 ): Promise<void> {
-  // Record what just happened so Claude has context for the next decision
+  const chain: ToolChainStep[] = [{ call: completedCall, result: toolResult }];
+  // Append the just-completed action's result to the in-memory conv store
+  // so future, separate user messages have it in their history.  This is
+  // narrative-only; the chain array is what continueAfterTool actually uses.
   _appendTurn(convKey, { role: 'assistant', content: `${completedCall.name} result: ${toolResult}` });
 
-  const updatedHistory: ConversationTurn[] = [
-    ...history,
-    { role: 'user', content: userMessage },
-    { role: 'assistant', content: `${completedCall.name} result: ${toolResult}` },
-  ];
-
-  try {
-    const next = await continueAfterTool(completedCall, toolResult, userMessage, updatedHistory);
+  for (let step = 0; step < MAX_TOOL_CHAIN_LENGTH; step++) {
+    let next;
+    try {
+      next = await continueAfterTool(chain, undefined, userMessage, history);
+    } catch (err) {
+      logger.error({ action: 'chain:continue_failed', err: String(err) }, 'continueAfterTool failed');
+      const last = chain[chain.length - 1].result;
+      await post(ctx.client, ctx.channel, ctx.threadTs, last);
+      _appendTurn(convKey, { role: 'assistant', content: last });
+      return;
+    }
 
     if (next.type === 'text') {
-      // Claude is done — post the conversational wrap-up
       await post(ctx.client, ctx.channel, ctx.threadTs, next.text);
       _appendTurn(convKey, { role: 'assistant', content: next.text });
       return;
     }
 
-    // Claude wants another tool — execute it (this recurses naturally for
-    // chains like inject_secret × 3, because the next inject_secret will
-    // also call _chainIfNeeded when it finishes)
-    await executeToolCall(next.call, ctx, convKey, userMessage, updatedHistory);
-  } catch {
-    // If continueAfterTool fails, just post the raw result as a fallback
-    await post(ctx.client, ctx.channel, ctx.threadTs, toolResult);
-    _appendTurn(convKey, { role: 'assistant', content: toolResult });
+    // Dispatch the next tool inline.  Crucially we do NOT recurse through
+    // executeToolCall — that path would re-enter _chainIfNeeded with a
+    // fresh empty chain, losing the accumulated context.
+    let nextResult: string;
+    try {
+      nextResult = await dispatchChainedTool(next.call, ctx, convKey, userMessage, history);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error({ action: 'chain:dispatch_failed', tool: next.call.name, err: msg }, 'Chained tool failed');
+      await post(ctx.client, ctx.channel, ctx.threadTs, `❌ Chained \`${next.call.name}\` failed: ${msg}`);
+      _appendTurn(convKey, { role: 'assistant', content: `Chained ${next.call.name} failed: ${msg}` });
+      return;
+    }
+
+    chain.push({ call: next.call, result: nextResult });
+    _appendTurn(convKey, { role: 'assistant', content: `${next.call.name} result: ${nextResult}` });
+  }
+
+  // Hit the safety cap
+  const cap = `_Stopped after ${MAX_TOOL_CHAIN_LENGTH} chained tool calls — that's the safety cap. Last call: \`${chain[chain.length - 1].call.name}\`. Ask again if you want me to continue._`;
+  await post(ctx.client, ctx.channel, ctx.threadTs, cap);
+  _appendTurn(convKey, { role: 'assistant', content: cap });
+}
+
+/**
+ * Dispatch a tool that's been chained off an earlier action.  Returns the
+ * result string so _chainIfNeeded can append it to the chain context.
+ *
+ * For action tools (put_secret, inject_secret, db_create_user, etc.) this
+ * is a thin wrapper around the existing handlers.  For info tools this
+ * fetches data and either returns it for further chaining, or — when the
+ * tool's job is to surface a human-readable answer (like list_secrets) —
+ * still returns the raw data so Claude can fold it into the next response.
+ *
+ * Read-only / gated tools (deploy, teardown, allow_user, edit_self, etc.)
+ * are NOT eligible for inline chain dispatch — they require user
+ * confirmation or special routing.  If Claude tries to chain to one of
+ * those, we throw, which terminates the chain cleanly.
+ */
+async function dispatchChainedTool(
+  call: AgentToolCall,
+  ctx: Ctx,
+  convKey: string,
+  _userMessage: string,
+  _history: ConversationTurn[],
+): Promise<string> {
+  switch (call.name) {
+    case 'put_secret':
+      return handlePutSecret(ctx, call.input as { name: string; value: string; description?: string }, convKey);
+    case 'inject_secret':
+      return handleInjectSecret(ctx, call.input as { repo: string; secret_name: string }, convKey);
+    case 'db_create_user':
+      return handleDbCreateUser(ctx, call.input as { username: string; create_database?: boolean }, convKey);
+    case 'db_drop_user':
+      return handleDbDropUser(ctx, call.input as { username: string; drop_database?: boolean }, convKey);
+    // Info / read-only tools — fetch raw data and return it; the caller
+    // will feed it back to Claude via continueAfterTool for synthesis.
+    case 'status':
+    case 'list_services':
+    case 'list_repos':
+    case 'inspect_repo':
+    case 'read_file':
+    case 'list_commits':
+    case 'cve_scan':
+    case 'discover_config':
+    case 'logs':
+    case 'clear_logs':
+    case 'list_secrets':
+    case 'db_schema':
+    case 'db_query':
+    case 'db_list_users':
+      return fetchToolData(call);
+    default:
+      // Gated or unsupported chain target — terminate the chain.
+      throw new Error(
+        `Cannot chain to \`${call.name}\` from another tool — it requires confirmation or special routing. The chain ends here.`,
+      );
   }
 }
 
@@ -849,14 +932,14 @@ async function handleInfoTool(
     if (gateResult !== 'pass') return;
   }
 
-  const updatedHistory: ConversationTurn[] = [
-    ...history,
-    { role: 'user',      content: userMessage },
-    { role: 'assistant', content: `${call.name} result: ${rawData.slice(0, 1000)}` },
-  ];
-
-  // Fire the next tool — for push_file this runs in background with loading animation
-  void executeToolCall(next.call, ctx, convKey, userMessage, updatedHistory);
+  // Pass the original history through unchanged — do NOT re-append
+  // userMessage here. continueAfterTool (called from _chainIfNeeded inside
+  // the chained tool's handler) already injects userMessage AND adds
+  // proper tool_use/tool_result blocks for completed steps.  Re-adding
+  // userMessage here was the source of the put_secret-loop bug:
+  // every chain step saw the user's request 3+ times and re-issued the
+  // same put_secret call.
+  await executeToolCall(next.call, ctx, convKey, userMessage, history);
 }
 
 /**
