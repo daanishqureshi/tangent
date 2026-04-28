@@ -22,6 +22,21 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ─── 1. Install ──────────────────────────────────────────────────────────────
+# Ubuntu's default repos don't ship Postgres 15, so add the PostgreSQL APT
+# (PGDG) repository first.  Idempotent — safe to re-run.
+echo "→ Adding PostgreSQL APT repository (PGDG)..."
+apt-get install -y -qq curl ca-certificates lsb-release gnupg
+
+install -d /usr/share/postgresql-common/pgdg
+if [[ ! -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc ]]; then
+  curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+fi
+
+CODENAME=$(lsb_release -cs)
+echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main" \
+  >/etc/apt/sources.list.d/pgdg.list
+
 echo "→ Installing Postgres 15 + pgvector..."
 apt-get update -qq
 apt-get install -y -qq postgresql-15 postgresql-contrib-15 postgresql-15-pgvector openssl
