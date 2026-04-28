@@ -692,6 +692,7 @@ async function executeToolCall(
   convKey: string,
   userMessage: string,
   history: ConversationTurn[],
+  chainDepth: number = 0,
 ): Promise<void> {
   switch (call.name) {
     case 'deploy':
@@ -751,7 +752,7 @@ async function executeToolCall(
     case 'read_self':
     case 'list_self_commits':
       if (!ensureSelfEditAllowed(ctx, convKey)) break;
-      await handleInfoTool(call, ctx, convKey, userMessage, history);
+      await handleInfoTool(call, ctx, convKey, userMessage, history, chainDepth);
       break;
     case 'edit_self':
       if (!ensureSelfEditAllowed(ctx, convKey)) break;
@@ -766,7 +767,7 @@ async function executeToolCall(
     case 'db_query':
     case 'db_list_users':
       // All read-only — handleInfoTool synthesises a conversational reply
-      await handleInfoTool(call, ctx, convKey, userMessage, history);
+      await handleInfoTool(call, ctx, convKey, userMessage, history, chainDepth);
       break;
     case 'db_create_user': {
       const result = await handleDbCreateUser(ctx, call.input as { username: string; create_database?: boolean }, convKey);
@@ -785,7 +786,7 @@ async function executeToolCall(
     }
     default:
       // Informational tools: fetch data, synthesize a conversational response via Claude
-      await handleInfoTool(call, ctx, convKey, userMessage, history);
+      await handleInfoTool(call, ctx, convKey, userMessage, history, chainDepth);
       break;
   }
 }
@@ -935,6 +936,7 @@ async function handleInfoTool(
   convKey: string,
   userMessage: string,
   history: ConversationTurn[],
+  chainDepth: number = 0,
 ): Promise<void> {
   const ts = await post(ctx.client, ctx.channel, ctx.threadTs, '_On it..._');
 
@@ -958,6 +960,18 @@ async function handleInfoTool(
     return;
   }
 
+  // Hard cap on chain depth.  Without this, info-tool recursion
+  // (inspect_repo → read_file → inspect_repo → ...) can run forever
+  // because each handleInfoTool call only sees the SINGLE most recent
+  // tool result, not the prior chain — so Claude has no memory of
+  // having already inspected the same repo and re-issues the same call.
+  if (chainDepth >= MAX_TOOL_CHAIN_LENGTH) {
+    const msg = `_Stopped after ${MAX_TOOL_CHAIN_LENGTH} chained tool calls — that's the safety cap. Last call: \`${call.name}\`. Tell me more specifically what you want me to do and I'll try a different approach._`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return;
+  }
+
   // Claude wants to chain to another tool (e.g. push_file after inspect_repo)
   // Close the info placeholder and kick off the next action
   await update(ctx.client, ctx.channel, ts, `✓ ${call.name} done`);
@@ -972,13 +986,10 @@ async function handleInfoTool(
   }
 
   // Pass the original history through unchanged — do NOT re-append
-  // userMessage here. continueAfterTool (called from _chainIfNeeded inside
-  // the chained tool's handler) already injects userMessage AND adds
-  // proper tool_use/tool_result blocks for completed steps.  Re-adding
-  // userMessage here was the source of the put_secret-loop bug:
-  // every chain step saw the user's request 3+ times and re-issued the
-  // same put_secret call.
-  await executeToolCall(next.call, ctx, convKey, userMessage, history);
+  // userMessage here. continueAfterTool already injects userMessage and
+  // adds proper tool_use/tool_result blocks for completed steps.
+  // Re-adding userMessage here was the source of the put_secret-loop bug.
+  await executeToolCall(next.call, ctx, convKey, userMessage, history, chainDepth + 1);
 }
 
 /**
