@@ -289,9 +289,20 @@ export async function createDbUser(opts: {
   const pool = adminPool();
   const client = await pool.connect();
   try {
-    // Quote the role name with double quotes; the regex above guarantees the
-    // string itself contains no double quotes that need escaping.
-    await client.query(`CREATE ROLE "${opts.username}" WITH LOGIN PASSWORD $1`, [password]);
+    // Quote the role name with double quotes; validateRoleName guarantees
+    // the string contains no double quotes that need escaping.
+    //
+    // CREATE ROLE does NOT support parameter binding for the password —
+    // it's DDL, $1 substitution only works in DML. We have to inline the
+    // password as a SQL string literal. generatePassword() returns only
+    // [A-Za-z0-9] (no quotes, no backslashes), so the escaped form is
+    // simply wrapping in single quotes; no further escaping is needed.
+    // Defense in depth: assert the alphabet here so a future change to
+    // generatePassword() can't silently introduce an injection vector.
+    if (!/^[A-Za-z0-9]+$/.test(password)) {
+      throw new Error('Generated password contains characters outside [A-Za-z0-9] — refusing to inline into DDL');
+    }
+    await client.query(`CREATE ROLE "${opts.username}" WITH LOGIN PASSWORD '${password}'`);
 
     let databaseName: string | null = null;
     if (opts.createDatabase) {
