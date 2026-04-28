@@ -2230,7 +2230,7 @@ async function handleDbCreateUser(
 ): Promise<string> {
   // Daanish only — Postgres role creation is high blast radius
   if (ctx.userId !== APPROVER_ID) {
-    const msg = '🔒 Only Daanish can create Postgres users — DB role names are sensitive and the password gets DM\'d to him.';
+    const msg = '🔒 Only Daanish can create Postgres users.';
     await post(ctx.client, ctx.channel, ctx.threadTs, msg);
     _appendTurn(convKey, { role: 'assistant', content: msg });
     return msg;
@@ -2262,63 +2262,23 @@ async function handleDbCreateUser(
     return msg;
   }
 
-  // Mirror the connection string into Secrets Manager so deployed services can inject it.
-  const secretName = `tangent/db/${result.username}`;
-  let secretSaved = false;
-  try {
-    const { CreateSecretCommand, PutSecretValueCommand, ResourceExistsException } = await import('@aws-sdk/client-secrets-manager');
-    const { smClient } = await import('./aws.js');
-    try {
-      await smClient().send(new CreateSecretCommand({
-        Name: secretName,
-        SecretString: result.connectionString,
-        Description: `Postgres connection string for role ${result.username}`,
-      }));
-    } catch (err) {
-      if (err instanceof ResourceExistsException || (err as { name?: string }).name === 'ResourceExistsException') {
-        await smClient().send(new PutSecretValueCommand({
-          SecretId: secretName,
-          SecretString: result.connectionString,
-        }));
-      } else {
-        throw err;
-      }
-    }
-    secretSaved = true;
-  } catch (err) {
-    logger.warn({ action: 'db_create_user:secret_save_failed', err: String(err) }, 'Could not mirror connection string to Secrets Manager');
-  }
+  // Post the password + connection string in the same thread the request
+  // came from. Per Daanish's preference: no DM, no Secrets Manager mirror.
+  // Daanish is the only one who can call this, so the password shows up
+  // wherever Daanish asked. (Heads-up: if Daanish runs this in a public
+  // channel, anyone in the channel will see the password.)
+  const reply = [
+    `✅ *Postgres role created: \`${result.username}\`*`,
+    result.databaseName ? `Database: \`${result.databaseName}\`` : '',
+    `Password: \`${result.password}\``,
+    `Connection string: \`${result.connectionString}\``,
+    '',
+    '_Save this password somewhere safe — I am not storing it anywhere. If you lose it, drop the user and recreate._',
+  ].filter(Boolean).join('\n');
+  await update(ctx.client, ctx.channel, ts, reply);
+  _appendTurn(convKey, { role: 'assistant', content: reply });
 
-  // Public ack — never includes the password
-  const publicMsg = result.databaseName
-    ? `✅ Created role \`${result.username}\` and database \`${result.databaseName}\`. Connection string saved to Secrets Manager as \`${secretName}\`${secretSaved ? '' : ' (⚠️  Secrets Manager save failed — see logs)'}.\nPassword DM'd to <@${APPROVER_ID}>.`
-    : `✅ Created role \`${result.username}\`. Connection string saved to Secrets Manager as \`${secretName}\`${secretSaved ? '' : ' (⚠️  Secrets Manager save failed — see logs)'}.\nPassword DM'd to <@${APPROVER_ID}>.`;
-  await update(ctx.client, ctx.channel, ts, publicMsg);
-  _appendTurn(convKey, { role: 'assistant', content: publicMsg });
-
-  // DM the password to Daanish — ONLY place the password is ever surfaced.
-  try {
-    const dm = await ctx.client.conversations.open({ users: APPROVER_ID });
-    const dmChannel = (dm.channel as { id?: string } | undefined)?.id;
-    if (dmChannel) {
-      const dmText = [
-        `:key: *Postgres role created: \`${result.username}\`*`,
-        result.databaseName ? `Database: \`${result.databaseName}\`` : '',
-        `Password: \`${result.password}\``,
-        `Connection string: \`${result.connectionString}\``,
-        secretSaved ? `Also stored in Secrets Manager as \`${secretName}\` — inject it via \`@Tangent inject ${secretName} into <repo>\`.` : '⚠️  *Secrets Manager save failed* — store this string somewhere safe.',
-        '',
-        '_This password is shown only once. The Secrets Manager copy is the source of truth going forward._',
-      ].filter(Boolean).join('\n');
-      await ctx.client.chat.postMessage({ channel: dmChannel, text: dmText });
-    } else {
-      logger.warn({ action: 'db_create_user:dm_open_failed' }, 'Could not open DM with Daanish to deliver password');
-    }
-  } catch (err) {
-    logger.warn({ action: 'db_create_user:dm_send_failed', err: String(err) }, 'Failed to DM password to Daanish');
-  }
-
-  return `Created Postgres role ${result.username}${result.databaseName ? ` and database ${result.databaseName}` : ''}. Connection string is in Secrets Manager as ${secretName}.`;
+  return `Created Postgres role ${result.username}${result.databaseName ? ` and database ${result.databaseName}` : ''}. Password and connection string posted to the requesting thread.`;
 }
 
 async function handleDbDropUser(

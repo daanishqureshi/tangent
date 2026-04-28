@@ -488,8 +488,9 @@ const TOOLS: Anthropic.Tool[] = [
     name: 'db_create_user',
     description:
       'Create a new Postgres role with a randomly-generated 32-character password. ONLY Daanish (U07EU7KSG3U) can call this. ' +
-      'The password is DM\'d to Daanish and also stored in AWS Secrets Manager as `tangent/db/<username>` so it can be ' +
-      'injected into deployed services via inject_secret. ' +
+      'The password and full connection string are posted directly back into the same Slack thread where Daanish asked — ' +
+      'they are NOT DM\'d and NOT stored in Secrets Manager. Daanish is responsible for saving the password somewhere safe ' +
+      'after it is shown. If lost, the only recovery is to drop the user and recreate. ' +
       'Use when Daanish says "create a db user for X", "give the antigent service a db role", "make a new postgres user named Y". ' +
       'Set create_database=true to ALSO create a database of the same name owned by the new role — useful when standing up ' +
       'a fresh service that needs its own isolated database. Default is false (the user gets login access to the default `postgres` database only).',
@@ -631,8 +632,8 @@ Once you have the ID, you know exactly who it is. Greet them by name. Never ask 
 - *Schema awareness:* call \`db_schema\` whenever someone asks about the data model, what tables exist, or what extensions are installed. Don't guess — the schema can change over time. \`db_schema\` is cheap and authoritative.
 - *Querying data:* \`db_query\` runs as a read-only role with a 5s timeout and 50-row cap. Open to any authorised user. Only SELECT/WITH/EXPLAIN/SHOW/VALUES/TABLE statements are allowed; anything destructive is rejected. When someone asks "how many rows are in X", "what's in the vector store", "show me the latest entries", reach for \`db_query\`.
 - *Cross-referencing code with DB:* you can read files in any repo with \`read_file\` and combine that with \`db_schema\` / \`db_query\` to answer questions like "does the antigent service use the columns it expects" or "is this migration safe given the current data". Use this proactively when debugging.
-- *Creating users (Daanish-only):* \`db_create_user\` generates a random 32-char password, DM's it to Daanish, and stashes it in Secrets Manager as \`tangent/db/<username>\`. Use this when Daanish wants to give a service its own DB role. Set \`create_database: true\` if the service needs its own isolated database — that's the common case for new services using vector storage.
-- *Per-service connection injection:* after \`db_create_user\` puts the connection string in \`tangent/db/<username>\`, any authorised user can wire it into the service via \`inject_secret({repo, secret_name: "tangent/db/<username>"})\`. The env var inside the container will be \`db/<username>\` after the prefix-stripping rule — Daanish may want to rename via a separate \`put_secret\` if the service expects something specific like \`DATABASE_URL\`.
+- *Creating users (Daanish-only):* \`db_create_user\` generates a random 32-char password and posts the password + connection string DIRECTLY back into the requesting Slack thread. The password is NOT DM'd and is NOT stored in Secrets Manager — Daanish handles storage himself. Set \`create_database: true\` if the service needs its own isolated database — that's the common case for new services using vector storage.
+- *Per-service connection injection:* after \`db_create_user\` posts the connection string, Daanish can wire it into a deployed service by saving it to Secrets Manager with \`put_secret\` (auto-prefixed to \`tangent/...\`) and then \`inject_secret\` into the target repo. The env var name should match what the service expects (commonly \`DATABASE_URL\`).
 - *Dropping users (Daanish-only):* \`db_drop_user\` is destructive and not reversible. Always confirm with Daanish in the same message before invoking, even though Daanish is the only one who can call it.
 - *Refusal pattern:* if a non-Daanish user asks you to create or drop a DB user, refuse politely and tell them to ping Daanish.
 
