@@ -1616,47 +1616,104 @@ async function fetchScan(): Promise<string> {
 
 async function fetchLogs(repo: string, container: string): Promise<string> {
   const { DescribeLogStreamsCommand, GetLogEventsCommand } = await import('@aws-sdk/client-cloudwatch-logs');
-  const { cwlClient } = await import('./aws.js');
-  const { logGroupName } = config();
+  const { ListTasksCommand, DescribeTasksCommand } = await import('@aws-sdk/client-ecs');
+  const { cwlClient, ecsClient } = await import('./aws.js');
+  const { SERVICE_PREFIX } = await import('../utils/constants.js');
+  const { logGroupName, ecsClusterName } = config();
 
   const logStreamPrefix = `${repo}-${container}`;
 
-  // Find the most recent log stream for this container
-  let streams;
+  // ── Step 1: Try to find the currently running task IDs for this service ──
+  // Reading logs from the LIVE task's stream is far more reliable than
+  // grabbing whichever stream had the most recent event (which can be the
+  // OLD task emitting "shutting down" during a deploy overlap).
+  let liveTaskIds: string[] = [];
   try {
-    const r = await cwlClient().send(new DescribeLogStreamsCommand({
-      logGroupName,
-      logStreamNamePrefix: logStreamPrefix,
-      limit: 10,
+    const tasksResult = await ecsClient().send(new ListTasksCommand({
+      cluster: ecsClusterName,
+      serviceName: `${SERVICE_PREFIX}${repo}`,
+      desiredStatus: 'RUNNING',
     }));
-    streams = r.logStreams ?? [];
-  } catch (err) {
-    throw new Error(`CloudWatch unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    const taskArns = tasksResult.taskArns ?? [];
+    if (taskArns.length > 0) {
+      // Task ARN is `arn:aws:ecs:region:acct:task/cluster/taskid` — grab the last segment
+      liveTaskIds = taskArns.map((arn) => arn.split('/').pop() ?? '').filter(Boolean);
+    }
+  } catch {
+    // ECS query failed — fall through to the prefix-based lookup
   }
-
-  if (streams.length === 0) {
-    return `No CloudWatch log streams found for "${repo}" (${container} container). The service may not have started yet.`;
-  }
-
-  // Sort by last event time descending, pick the most recent
-  const sorted = [...streams].sort((a, b) => (b.lastEventTimestamp ?? 0) - (a.lastEventTimestamp ?? 0));
-  const best = sorted[0];
-  const streamName = best.logStreamName!;
 
   // Only fetch logs from the last 30 minutes by default — stale logs from
   // previous deployments are noise and confuse both Claude and the user.
   const RECENT_WINDOW_MS = 30 * 60 * 1000;
   const startTime = Date.now() - RECENT_WINDOW_MS;
 
+  let streamName: string | null = null;
+  let lastEventMs = 0;
+
+  // ── Step 2a: If we have a live task, construct its exact stream name ─────
+  // awslogs driver naming: {stream-prefix}/{container-name}/{task-id}
+  // stream-prefix in the task def is `{repo}-{container}` and container-name
+  // is just `{container}` (literally "app" or "ngrok").
+  if (liveTaskIds.length > 0) {
+    // Try the most recent task first. If multiple are running (during a
+    // rolling deploy), prefer the one with logs emitted in the window.
+    for (const taskId of liveTaskIds) {
+      const candidate = `${logStreamPrefix}/${container}/${taskId}`;
+      try {
+        const r = await cwlClient().send(new DescribeLogStreamsCommand({
+          logGroupName,
+          logStreamNamePrefix: candidate,
+          limit: 1,
+        }));
+        const found = r.logStreams?.[0];
+        if (found?.logStreamName) {
+          streamName = found.logStreamName;
+          lastEventMs = found.lastEventTimestamp ?? 0;
+          break;
+        }
+      } catch {
+        // try next task
+      }
+    }
+  }
+
+  // ── Step 2b: Fallback — find the most recent stream by prefix ────────────
+  if (!streamName) {
+    let streams;
+    try {
+      const r = await cwlClient().send(new DescribeLogStreamsCommand({
+        logGroupName,
+        logStreamNamePrefix: logStreamPrefix,
+        orderBy: 'LastEventTime',
+        descending: true,
+        limit: 5,
+      }));
+      streams = r.logStreams ?? [];
+    } catch (err) {
+      throw new Error(`CloudWatch unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    if (streams.length === 0) {
+      return `No CloudWatch log streams found for "${repo}" (${container} container). The service may not have started yet.`;
+    }
+
+    const best = streams[0];
+    streamName = best.logStreamName!;
+    lastEventMs = best.lastEventTimestamp ?? 0;
+  }
+
   // Compute age of this stream's last event so stale data is clearly flagged
-  const lastEventMs = best.lastEventTimestamp ?? 0;
   const ageMs = Date.now() - lastEventMs;
   const ageHours = Math.floor(ageMs / (1000 * 60 * 60));
   const ageMinutes = Math.floor((ageMs % (1000 * 60 * 60)) / (1000 * 60));
   const ageStr = ageHours > 0 ? `${ageHours}h ${ageMinutes}m ago` : `${ageMinutes}m ago`;
 
-  // If the entire stream is older than our window, say so explicitly
-  if (lastEventMs < startTime) {
+  // If the entire stream is older than our window, say so explicitly.
+  // Skip this check if we have a live task — newly-started containers haven't
+  // emitted anything yet but their stream is the right one to wait on.
+  const fromLiveTask = liveTaskIds.length > 0;
+  if (!fromLiveTask && lastEventMs > 0 && lastEventMs < startTime) {
     return `No recent logs for "${repo}" (${container} container). Last log entry was ${ageStr} — likely from a previous deployment. The current container may still be starting up, or it crashed before emitting any logs. Try again in 30-60 seconds, or run "clear logs for ${repo}" to wipe stale streams.`;
   }
 
@@ -1672,6 +1729,16 @@ async function fetchLogs(repo: string, container: string): Promise<string> {
     events = (r.events ?? []).map((e) => e.message ?? '').filter(Boolean);
   } catch (err) {
     throw new Error(`Failed to read log stream: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Avoid unused-import warnings if DescribeTasksCommand isn't otherwise used
+  void DescribeTasksCommand;
+
+  // If logs are empty AND we know we're tracking the live task, say so —
+  // this means the container is up but hasn't written anything yet, OR it
+  // already crashed before writing.
+  if (events.length === 0 && fromLiveTask) {
+    return `Stream \`${streamName}\` is the LIVE task's log stream but has no entries in the last 30 minutes. The container is either still booting or crashed before writing logs. Check ECS task status — task ID: ${liveTaskIds[0]}.`;
   }
 
   // For ngrok container, extract the tunnel URL if present
