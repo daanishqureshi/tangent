@@ -304,6 +304,13 @@ export async function createDbUser(opts: {
     }
     await client.query(`CREATE ROLE "${opts.username}" WITH LOGIN PASSWORD '${password}'`);
 
+    // Grant the new role TO tangent_admin so tangent_admin is a member of it.
+    // This is required for later REASSIGN OWNED / DROP OWNED operations:
+    // those commands need the executing role to be a member of BOTH the
+    // source and target roles.  Without this grant, dropDbUser() fails with
+    // "permission denied to reassign objects".
+    await client.query(`GRANT "${opts.username}" TO tangent_admin`);
+
     let databaseName: string | null = null;
     if (opts.createDatabase) {
       databaseName = opts.username;
@@ -341,6 +348,19 @@ export async function dropDbUser(username: string, dropDatabase: boolean): Promi
     if (dropDatabase) {
       await client.query(`DROP DATABASE IF EXISTS "${username}"`);
     }
+
+    // REASSIGN OWNED / DROP OWNED require the executing role (tangent_admin)
+    // to be a member of the target role.  Defensive grant — idempotent, and
+    // covers roles that were created before createDbUser started doing this
+    // automatically.  tangent_admin's CREATEROLE privilege lets it grant any
+    // role to itself.
+    try {
+      await client.query(`GRANT "${username}" TO tangent_admin`);
+    } catch {
+      // If the grant fails (e.g. role doesn't exist), let the subsequent
+      // commands surface the real error.
+    }
+
     // REASSIGN OWNED so we don't leak orphaned privileges on objects the
     // role created in shared databases.
     await client.query(`REASSIGN OWNED BY "${username}" TO tangent_admin`);
