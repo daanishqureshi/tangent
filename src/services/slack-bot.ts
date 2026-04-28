@@ -1027,8 +1027,18 @@ async function handleInfoTool(
     }
 
     // Truly gated tool (deploy, teardown, bash, allow_user, etc.) — can't
-    // chain automatically.  Tell Claude to ask as a separate request.
-    const gatedMsg = `_Can't automatically chain to \`${next.call.name}\` — it requires its own confirmation. Ask me to \`${next.call.name}\` as a separate request._`;
+    // chain automatically.  For deploy, surface the params and ask for
+    // confirmation so the user can just say "yes".  For everything else,
+    // give a clean prompt to ask again.
+    let gatedMsg: string;
+    if (next.call.name === 'deploy') {
+      const di = (next.call as { name: 'deploy'; input: { repo: string; branch: string; port: number } }).input;
+      gatedMsg = `I've finished checking the repo. Here's what I'd run:\n\n` +
+        `*Repo:* \`${di.repo}\`  *Branch:* \`${di.branch ?? 'main'}\`  *Port:* \`${di.port}\`\n\n` +
+        `Ready to deploy? Just say *yes* and I'll kick it off.`;
+    } else {
+      gatedMsg = `_I'd like to run \`${next.call.name}\` next but it needs its own confirmation — ask me to do that as a follow-up._`;
+    }
     await update(ctx.client, ctx.channel, ts, gatedMsg);
     _appendTurn(convKey, { role: 'assistant', content: gatedMsg });
     return;
