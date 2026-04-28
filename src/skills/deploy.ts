@@ -80,7 +80,16 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
 
   // ─── Build container definitions ─────────────────────────────────────────
 
-  const appEnv = Object.entries(env).map(([name, value]) => ({ name, value }));
+  // Inject DB connection constants into every app container so services can reach
+  // the shared Postgres on the Tangent EC2 without any extra inject_secret steps.
+  // DB_PASSWORD is NOT injected here — services request it via inject_secret when
+  // they need write access.  Service-supplied env vars override these defaults.
+  const dbDefaults: Record<string, string> = {
+    DB_HOST: '10.40.40.123',
+    DB_PORT: '5432',
+  };
+  const mergedEnv: Record<string, string> = { ...dbDefaults, ...env };
+  const appEnv = Object.entries(mergedEnv).map(([name, value]) => ({ name, value }));
 
   const appLogConfig: LogConfiguration = {
     logDriver: 'awslogs',

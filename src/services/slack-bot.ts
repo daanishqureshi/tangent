@@ -22,6 +22,7 @@ import type { KnownBlock } from '@slack/types';
 import { config, allowUser } from '../config.js';
 import { processMessage, continueAfterTool, classifyConsent, diagnoseServiceFailure, identifyFileToFix, generateCodeFix, type ConversationTurn, type AgentToolCall, type ToolChainStep } from './ai.js';
 import { buildSkill, DockerfileNotFoundError, DockerBuildError } from '../skills/build.js';
+import { runDeployAnalysis } from '../skills/analyze.js';
 import { deploySkill } from '../skills/deploy.js';
 import { tunnelSkill, TunnelTimeoutError } from '../skills/tunnel.js';
 import { teardownSkill } from '../skills/teardown.js';
@@ -795,7 +796,7 @@ async function executeToolCall(
  * Maximum number of chained tool calls per user message — guards against
  * Claude getting stuck in a loop or running away on a long chain.
  */
-const MAX_TOOL_CHAIN_LENGTH = 12;
+const MAX_TOOL_CHAIN_LENGTH = 30;
 
 /**
  * After an action tool completes, ask Claude what's next.  If Claude wants
@@ -904,6 +905,8 @@ async function dispatchChainedTool(
     case 'inspect_repo':
     case 'read_file':
     case 'list_commits':
+    case 'read_self':
+    case 'list_self_commits':
     case 'cve_scan':
     case 'discover_config':
     case 'logs':
@@ -922,13 +925,21 @@ async function dispatchChainedTool(
 }
 
 /**
- * For read-only / informational tools:
- * 1. Post a placeholder ("working on it...")
- * 2. Fetch the raw tool data
- * 3. Feed result back to Claude via continueAfterTool — Claude either:
- *    a) Responds conversationally (done), OR
- *    b) Calls another tool (e.g. inspect_repo → push_file chain)
- * 4. If Claude chains to another tool, execute it in the background with a loading animation
+ * For read-only / informational tools — runs a loop that accumulates every
+ * tool result into a ToolChainStep[] before passing to continueAfterTool.
+ *
+ * ROOT CAUSE of the old list_secrets → db_schema → list_secrets loop:
+ *   The previous implementation called continueAfterTool with only the SINGLE
+ *   most recent result each iteration.  Claude had no memory of prior calls and
+ *   re-issued them, hitting MAX_TOOL_CHAIN_LENGTH without making progress.
+ *
+ * FIX: accumulate ALL completed steps in `chain` and pass the full array to
+ *   continueAfterTool every iteration — identical to what _chainIfNeeded does
+ *   for action tools.  Claude sees settled tool_use/tool_result pairs for
+ *   every prior call and knows not to repeat them.
+ *
+ * chainDepth is kept in the signature for call-site compatibility but is no
+ * longer used to drive recursion — the loop itself enforces MAX_TOOL_CHAIN_LENGTH.
  */
 async function handleInfoTool(
   call: AgentToolCall,
@@ -936,10 +947,11 @@ async function handleInfoTool(
   convKey: string,
   userMessage: string,
   history: ConversationTurn[],
-  chainDepth: number = 0,
+  _chainDepth: number = 0,
 ): Promise<void> {
   const ts = await post(ctx.client, ctx.channel, ctx.threadTs, '_On it..._');
 
+  // ── Fetch the first tool's data ────────────────────────────────────────────
   let rawData: string;
   try {
     rawData = await fetchToolData(call);
@@ -950,46 +962,82 @@ async function handleInfoTool(
     return;
   }
 
-  // Ask Claude what to do next — it can respond with text OR call another tool
-  const next = await continueAfterTool(call, rawData, userMessage, history);
+  // ── Accumulate results in a chain ─────────────────────────────────────────
+  // Every iteration passes the full chain so Claude can see all prior reads.
+  const chain: ToolChainStep[] = [{ call, result: rawData }];
 
-  if (next.type === 'text') {
-    // Claude is done — show the conversational reply
-    await update(ctx.client, ctx.channel, ts, next.text);
-    _appendTurn(convKey, { role: 'assistant', content: next.text });
+  for (let step = 0; step < MAX_TOOL_CHAIN_LENGTH; step++) {
+    let next;
+    try {
+      next = await continueAfterTool(chain, undefined, userMessage, history);
+    } catch (err) {
+      logger.error({ action: 'info_chain:continue_failed', err: String(err) }, 'continueAfterTool failed in info chain');
+      const lastResult = chain[chain.length - 1].result;
+      await update(ctx.client, ctx.channel, ts, lastResult);
+      _appendTurn(convKey, { role: 'assistant', content: lastResult });
+      return;
+    }
+
+    if (next.type === 'text') {
+      // Claude has enough context — post the final reply.
+      await update(ctx.client, ctx.channel, ts, next.text);
+      _appendTurn(convKey, { role: 'assistant', content: next.text });
+      return;
+    }
+
+    // Claude wants another tool.  Try inline dispatch first (info tools +
+    // action tools that don't require confirmation).
+    const prevName = chain[chain.length - 1].call.name;
+    let nextResult: string;
+    let dispatched = false;
+    try {
+      nextResult = await dispatchChainedTool(next.call, ctx, convKey, userMessage, history);
+      dispatched = true;
+    } catch {
+      // dispatchChainedTool throws for writing tools and gated tools — handled below.
+      nextResult = '';
+    }
+
+    if (dispatched) {
+      // Inline dispatch succeeded — accumulate and keep looping.
+      await update(ctx.client, ctx.channel, ts, `✓ ${prevName} · running ${next.call.name}...`);
+      chain.push({ call: next.call, result: nextResult });
+      _appendTurn(convKey, { role: 'assistant', content: `${next.call.name} result: ${nextResult}` });
+      continue;
+    }
+
+    // ── Not dispatchable inline — check if it's a writing/action tool ────────
+    const writingTools = new Set([
+      'push_file', 'edit_file', 'edit_self', 'push_self', 'restore_file',
+    ]);
+
+    if (writingTools.has(next.call.name)) {
+      // Transition from reading → writing.  Apply gates, then hand off to
+      // executeToolCall which handles posting + the action chain from there.
+      await update(ctx.client, ctx.channel, ts, `✓ ${prevName} done`);
+      _appendTurn(convKey, { role: 'assistant', content: `Ran ${prevName}, continuing...` });
+
+      if (next.call.name === 'push_file') {
+        const gateResult = await gatePushFile(next.call, ctx, convKey);
+        if (gateResult !== 'pass') return;
+      }
+
+      await executeToolCall(next.call, ctx, convKey, userMessage, history, step + 1);
+      return;
+    }
+
+    // Truly gated tool (deploy, teardown, bash, allow_user, etc.) — can't
+    // chain automatically.  Tell Claude to ask as a separate request.
+    const gatedMsg = `_Can't automatically chain to \`${next.call.name}\` — it requires its own confirmation. Ask me to \`${next.call.name}\` as a separate request._`;
+    await update(ctx.client, ctx.channel, ts, gatedMsg);
+    _appendTurn(convKey, { role: 'assistant', content: gatedMsg });
     return;
   }
 
-  // Hard cap on chain depth.  Without this, info-tool recursion
-  // (inspect_repo → read_file → inspect_repo → ...) can run forever
-  // because each handleInfoTool call only sees the SINGLE most recent
-  // tool result, not the prior chain — so Claude has no memory of
-  // having already inspected the same repo and re-issues the same call.
-  if (chainDepth >= MAX_TOOL_CHAIN_LENGTH) {
-    const msg = `_Stopped after ${MAX_TOOL_CHAIN_LENGTH} chained tool calls — that's the safety cap. Last call: \`${call.name}\`. Tell me more specifically what you want me to do and I'll try a different approach._`;
-    await update(ctx.client, ctx.channel, ts, msg);
-    _appendTurn(convKey, { role: 'assistant', content: msg });
-    return;
-  }
-
-  // Claude wants to chain to another tool (e.g. push_file after inspect_repo)
-  // Close the info placeholder and kick off the next action
-  await update(ctx.client, ctx.channel, ts, `✓ ${call.name} done`);
-  _appendTurn(convKey, { role: 'assistant', content: `Ran ${call.name}, continuing...` });
-
-  // Run any sanity gates that route() would have run for the chained call.
-  // Critical: without this, a chained read_file → push_file bypassed the
-  // existing-file confirmation prompt and could land an empty file on main.
-  if (next.call.name === 'push_file') {
-    const gateResult = await gatePushFile(next.call, ctx, convKey);
-    if (gateResult !== 'pass') return;
-  }
-
-  // Pass the original history through unchanged — do NOT re-append
-  // userMessage here. continueAfterTool already injects userMessage and
-  // adds proper tool_use/tool_result blocks for completed steps.
-  // Re-adding userMessage here was the source of the put_secret-loop bug.
-  await executeToolCall(next.call, ctx, convKey, userMessage, history, chainDepth + 1);
+  // Hit the safety cap
+  const cap = `_Stopped after ${MAX_TOOL_CHAIN_LENGTH} chained tool calls — safety cap reached. Last: \`${chain[chain.length - 1].call.name}\`. Ask me to continue with a more specific request._`;
+  await update(ctx.client, ctx.channel, ts, cap);
+  _appendTurn(convKey, { role: 'assistant', content: cap });
 }
 
 /**
@@ -1533,10 +1581,52 @@ async function handleDeploy(
 ): Promise<void> {
   const actor = userId ? `<@${userId}>` : 'someone';
 
+  // ── Pre-deploy analysis ────────────────────────────────────────────────────
   const ts = await post(client, channel, threadTs,
-    `🔨 Building \`${repo}\` from \`${branch}\`...`,
-    statusBlocks({ repo, branch, port, actor, stage: 'building' }),
+    `🔍 Analyzing \`${repo}\` before deploy...`,
   );
+
+  let analysis;
+  try {
+    analysis = await runDeployAnalysis(repo, branch);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn({ action: 'deploy:analysis_error', repo, err: msg }, 'Analysis threw — proceeding anyway');
+    // Non-fatal: if analysis itself errors, don't block the deploy
+    analysis = { eligible: true, detectedPort: null, blockers: [], warnings: [], claudeCodePrompt: null };
+  }
+
+  // If blockers found — stop here, give developer a fix prompt
+  if (!analysis.eligible && analysis.blockers.length > 0) {
+    const blockerLines = analysis.blockers
+      .map((b, i) => `*${i + 1}. ${b.issue}*\n   _Fix:_ ${b.fix}`)
+      .join('\n\n');
+
+    const promptBlock = analysis.claudeCodePrompt
+      ? `\n\n*Fix it with Claude Code — paste this into your terminal inside the \`${repo}\` repo:*\n\`\`\`\nclaud -p "${analysis.claudeCodePrompt.replace(/"/g, '\\"')}"\n\`\`\``
+      : '';
+
+    const msg = `❌ *\`${repo}\` is not ready to deploy* — ${analysis.blockers.length} blocker(s) found:\n\n${blockerLines}${promptBlock}\n\n_Fix the issues above, then ask me to deploy again._`;
+    await update(client, channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return;
+  }
+
+  // Use port from Dockerfile EXPOSE if Claude guessed wrong
+  const resolvedPort = analysis.detectedPort ?? port;
+
+  // Surface any warnings, then proceed
+  const warningText = analysis.warnings.length > 0
+    ? `\n⚠️ *Warnings:* ${analysis.warnings.map((w) => w.issue).join(' · ')}`
+    : '';
+
+  await update(client, channel, ts,
+    `✓ Analysis passed.${warningText}\n🔨 Building \`${repo}\` from \`${branch}\`...`,
+    statusBlocks({ repo, branch, port: resolvedPort, actor, stage: 'building' }),
+  );
+
+  // Shadow-replace port with the detected value for the rest of the deploy
+  port = resolvedPort;
 
   // ── Build ──────────────────────────────────────────────────────────────────
   let imageUri: string;
