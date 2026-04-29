@@ -842,6 +842,15 @@ async function _chainIfNeeded(
       return;
     }
 
+    // Confirmation-gated tools (bash, teardown) can't be dispatched inline
+    // because they need a human "yes" before executing.  Break out of the
+    // chain cleanly and hand off to executeToolCall — the confirmation prompt
+    // appears normally and the user can approve it as a follow-up.
+    if (next.call.name === 'bash' || next.call.name === 'teardown') {
+      await executeToolCall(next.call, ctx, convKey, userMessage, history, step + 1);
+      return;
+    }
+
     // Dispatch the next tool inline.  Crucially we do NOT recurse through
     // executeToolCall — that path would re-enter _chainIfNeeded with a
     // fresh empty chain, losing the accumulated context.
@@ -1008,7 +1017,7 @@ async function handleInfoTool(
 
     // ── Not dispatchable inline — check if it's a writing/action tool ────────
     const writingTools = new Set([
-      'push_file', 'edit_file', 'edit_self', 'push_self', 'restore_file',
+      'push_file', 'edit_file', 'edit_self', 'push_self', 'restore_file', 'bash',
     ]);
 
     if (writingTools.has(next.call.name)) {
