@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(/opt/homebrew/bin/npm install:*)",
+      "Bash(export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\")",
+      "Bash(node -e \"import\\(''''./dist/index.js''''\\)\")",
+      "Bash(npm run:*)",
+      "WebFetch(domain:github.com)",
+      "Read(//opt/homebrew/lib/node_modules/npm/bin/**)",
+      "Bash(/opt/homebrew/bin/npm run:*)",
+      "Read(//opt/homebrew/Cellar/**)",
+      "Read(//opt/homebrew/opt/**)",
+      "Read(//opt/homebrew/**)",
+      "Bash(PATH=/opt/homebrew/Cellar/node/24.6.0/bin:$PATH npm run build)",
+      "Bash(PATH=/opt/homebrew/Cellar/node/24.6.0/bin:$PATH npx pm2 list)",
+      "Bash(PATH=/opt/homebrew/Cellar/node/24.6.0/bin:$PATH pgrep -lf \"node.*tangent\")",
+      "Bash(kill -0 37368)",
+      "WebFetch(domain:www.clarifai.com)",
+      "WebFetch(domain:openclaw.ai)",
+      "WebFetch(domain:ourtake.bakerbotts.com)",
+      "Bash(rsync -avz -e \"ssh -i ~/.ssh/litgrab.pem\" --exclude='.git' --exclude='node_modules' --exclude='.env' . ubuntu@98.84.123.71:/home/ubuntu/tangent/)",
+      "Bash(ssh -i ~/.ssh/litgrab.pem ubuntu@98.84.123.71 \"cd /home/ubuntu/tangent && npm run build 2>&1 | tail -5 && pm2 restart tangent && sleep 2 && pm2 status --no-color | tail -4\")",
+      "mcp__tangent__push_file",
+      "Bash(ssh -i ~/.ssh/litgrab.pem ubuntu@98.84.123.71 \"cd /home/ubuntu/tangent && npm run build 2>&1 | tail -2 && pm2 restart tangent && sleep 2 && pm2 status --no-color | tail -4\")"
+    ]
+  }
+}
