@@ -5,6 +5,8 @@
 import type { FastifyInstance } from 'fastify';
 import { teardownSkill } from '../skills/teardown.js';
 import { notifyTeardown } from '../services/slack.js';
+import { requireMutationAuth } from '../services/auth.js';
+import { recordAuditEvent } from '../services/audit.js';
 import { logger } from '../utils/logger.js';
 
 interface TeardownBody {
@@ -23,9 +25,16 @@ export async function teardownRoutes(app: FastifyInstance): Promise<void> {
       },
     },
   }, async (req, reply) => {
+    if (!await requireMutationAuth(req, reply)) return;
     const { repo } = req.body;
 
     logger.info({ action: 'route:teardown:start', repo }, 'Teardown request received');
+    await recordAuditEvent({
+      action: 'http:teardown',
+      actor: 'http-client',
+      surface: 'http',
+      target: repo,
+    });
 
     try {
       await teardownSkill({ repo });

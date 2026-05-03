@@ -1,7 +1,7 @@
 /**
  * cron/health-check.ts
  *
- * Runs every 5 minutes. Checks ECS service health for all vibecode-* services
+ * Runs every 5 minutes. Checks ECS service health for all tangent-* services
  * and alerts Slack if any have been degraded for more than 10 minutes.
  */
 

@@ -10,9 +10,12 @@
 
 import type { FastifyInstance } from 'fastify';
 import { buildSkill, DockerfileNotFoundError, DockerBuildError } from '../skills/build.js';
+import { runDeployAnalysis } from '../skills/analyze.js';
 import { deploySkill } from '../skills/deploy.js';
 import { tunnelSkill, TunnelTimeoutError } from '../skills/tunnel.js';
-import { notifyDeployed, notifyDeployUrl, notifyDeployError } from '../services/slack.js';
+import { notifyDeployed, notifyDeployError } from '../services/slack.js';
+import { requireMutationAuth } from '../services/auth.js';
+import { recordAuditEvent } from '../services/audit.js';
 import { logger } from '../utils/logger.js';
 
 interface DeployBody {
@@ -35,9 +38,34 @@ export async function deployRoutes(app: FastifyInstance): Promise<void> {
       },
     },
   }, async (req, reply) => {
+    if (!await requireMutationAuth(req, reply)) return;
     const { repo, branch = 'main', port = 8080 } = req.body;
+    let resolvedPort = port;
 
     logger.info({ action: 'route:deploy:start', repo, branch, port }, 'Deploy request received');
+    await recordAuditEvent({
+      action: 'http:deploy',
+      actor: 'http-client',
+      surface: 'http',
+      target: repo,
+      metadata: { branch, port },
+    });
+
+    // Match the Slack path's pre-deploy readiness check before spending build
+    // time or mutating ECS. If analysis itself fails, proceed like Slack does.
+    try {
+      const analysis = await runDeployAnalysis(repo, branch);
+      if (!analysis.eligible && analysis.blockers.length > 0) {
+        return reply.status(422).send({
+          error: 'Repo is not ready to deploy',
+          blockers: analysis.blockers,
+          claudeCodePrompt: analysis.claudeCodePrompt,
+        });
+      }
+      resolvedPort = analysis.detectedPort ?? port;
+    } catch (err) {
+      logger.warn({ action: 'route:deploy:analysis_failed', repo, err }, 'Pre-deploy analysis failed; proceeding');
+    }
 
     // ── Step 1: Build ─────────────────────────────────────────────────────────
     let imageUri: string;
@@ -69,11 +97,15 @@ export async function deployRoutes(app: FastifyInstance): Promise<void> {
     // ── Step 2: Deploy ────────────────────────────────────────────────────────
     let serviceName: string;
     let taskDefinition: string;
+    let deployedAt: number;
+    let expectedUrl: string;
 
     try {
-      const deployResult = await deploySkill({ repo, imageUri, port });
+      const deployResult = await deploySkill({ repo, imageUri, port: resolvedPort });
       serviceName = deployResult.serviceName;
       taskDefinition = deployResult.taskDefinition;
+      deployedAt = deployResult.deployedAt;
+      expectedUrl = deployResult.ngrokUrl;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error({ action: 'route:deploy:ecs_failed', repo, err }, 'ECS deploy failed');
@@ -85,7 +117,7 @@ export async function deployRoutes(app: FastifyInstance): Promise<void> {
     const imageTag = imageUri.split(':').pop() ?? sha;
 
     // Fire-and-forget tunnel polling + Slack notification
-    void backgroundTunnelAndNotify({ repo, imageTag, imageUri, serviceName });
+    void backgroundTunnelAndNotify({ repo, imageTag, imageUri, serviceName, deployedAt, expectedUrl });
 
     logger.info({ action: 'route:deploy:accepted', repo, serviceName }, 'Deploy accepted, tunnel URL pending');
 
@@ -95,6 +127,8 @@ export async function deployRoutes(app: FastifyInstance): Promise<void> {
       url: 'pending',
       imageUri,
       service: serviceName,
+      taskDefinition,
+      port: resolvedPort,
     });
   });
 }
@@ -106,11 +140,13 @@ async function backgroundTunnelAndNotify(params: {
   imageTag: string;
   imageUri: string;
   serviceName: string;
+  deployedAt: number;
+  expectedUrl: string;
 }): Promise<void> {
-  const { repo, imageTag, imageUri, serviceName } = params;
+  const { repo, imageTag, imageUri, serviceName, deployedAt, expectedUrl } = params;
 
   try {
-    const { url } = await tunnelSkill({ repo });
+    const { url } = await tunnelSkill({ repo, deployedAt, expectedUrl });
 
     await notifyDeployed({ repo, url, imageTag });
     logger.info({ action: 'route:deploy:tunnel_ready', repo, url }, 'Tunnel URL notified to Slack');

@@ -523,7 +523,7 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: 'bash',
     description:
-      'Execute a bash command on the Tangent EC2 (10.40.40.123) — the same host Tangent runs on. ' +
+      'Execute a bash command on the Tangent EC2 — the same host Tangent runs on. ' +
       '*ONLY Daanish (U07EU7KSG3U) can call this, and ONLY in a DM with Tangent.* ' +
       'Every invocation triggers a confirmation prompt that shows Daanish the exact command before it runs — Daanish must reply "yes" to execute. ' +
       'Use this for ops tasks that previously required SSH: editing /etc/postgresql/15/main/pg_hba.conf, reloading services (e.g. `sudo -u postgres psql -c "SELECT pg_reload_conf();"`), inspecting disk usage, tailing /var/log files, running pg_dump, checking systemd unit status, etc. ' +
@@ -548,7 +548,8 @@ const TOOLS: Anthropic.Tool[] = [
 // ─── System prompt ────────────────────────────────────────────────────────────
 
 function buildSystemPrompt(): string {
-  const { peopleNotes } = config();
+  const cfg = config();
+  const { peopleNotes } = cfg;
   const peopleSection = peopleNotes.length > 0
     ? '\n\n*Memories — what you know about specific people:*\n' +
       '*This section is your long-term memory. It is updated automatically as you learn things. Trust it.*\n' +
@@ -556,7 +557,15 @@ function buildSystemPrompt(): string {
         `\n*${p.name}* (${p.id}):\n` + p.notes.map((n) => `  - ${n}`).join('\n')
       ).join('\n')
     : '';
-  return SYSTEM_PROMPT_BASE + peopleSection;
+  const infraSection = [
+    '\n\n*Current Tangent infrastructure facts (from runtime config):*',
+    `- ECS cluster: ${cfg.ecsClusterName} (${cfg.awsRegion})`,
+    `- GitHub org: ${cfg.githubOrg}`,
+    `- Secrets Manager prefix for app secrets: ${cfg.secretsManagerPrefix}`,
+    `- Deployed app DB host/port: ${cfg.pgHostInternalIp}:5432`,
+    `- Ngrok OAuth domains: ${cfg.ngrokOAuthDomains.join(', ')}`,
+  ].join('\n');
+  return SYSTEM_PROMPT_BASE + infraSection + peopleSection;
 }
 
 const SYSTEM_PROMPT_BASE = `You are *Tangent* — the AI version of Chris Tan, Impiricus's Employee #2 and DevOps lead.
@@ -660,7 +669,7 @@ Once you have the ID, you know exactly who it is. Greet them by name. Never ask 
 - Defaults: branch = main, port = 8080
 
 *Postgres — Tangent's own database (not an external service):*
-- Postgres 15 + pgvector runs on the same EC2 as you (10.40.40.123:5432). This is YOUR infrastructure. Every deployed app container already receives \`DB_HOST=10.40.40.123\` and \`DB_PORT=5432\` as plain env vars at deploy time — no injection needed for those two.
+- Postgres 15 + pgvector runs on the same EC2 as you. Use the runtime config facts above for the current DB host. Every deployed app container already receives \`DB_HOST\` and \`DB_PORT=5432\` as plain env vars at deploy time — no injection needed for those two.
 - *Standard DB access pattern for a service:*
   1. The service already has \`DB_HOST\` and \`DB_PORT\` injected automatically.
   2. For the password: run \`inject_secret DB_PASSWORD into <repo>\` — this wires \`tangent/DB_PASSWORD\` from Secrets Manager into the container as \`DB_PASSWORD\`. Done.
@@ -674,7 +683,7 @@ Once you have the ID, you know exactly who it is. Greet them by name. Never ask 
 - *Refusal pattern:* if a non-Daanish user asks to create or drop a DB user, refuse politely and tell them to ping Daanish.
 
 *Bash on the host (Daanish-only, DM-only — high-risk tool, read carefully):*
-- You CAN execute bash commands directly on the Tangent EC2 (10.40.40.123). You run on this same host, so SSH is unnecessary for ops tasks like editing pg_hba.conf, reloading services, tailing /var/log, running pg_dump, checking systemd, etc.
+- You CAN execute bash commands directly on the Tangent EC2. You run on this same host, so SSH is unnecessary for ops tasks like editing pg_hba.conf, reloading services, tailing /var/log, running pg_dump, checking systemd, etc.
 - HARD GATES — the \`bash\` tool will refuse to run unless ALL of these are true:
   1. The caller is Daanish (U07EU7KSG3U). For anyone else, refuse politely and tell them to ping Daanish.
   2. The conversation is a DM with you (not a public/private channel, not a thread). For channel requests, ask Daanish to DM you instead.
@@ -1458,6 +1467,7 @@ export async function analyzeDeployEligibility(
   },
 ): Promise<DeployAnalysis> {
   logger.info({ action: 'ai:analyze_deploy', repo }, 'Analyzing repo deploy eligibility');
+  const cfg = config();
 
   const dataSection = [
     `REPO: ${repo}`,
@@ -1477,7 +1487,7 @@ export async function analyzeDeployEligibility(
 TANGENT'S DEPLOYMENT MODEL (know this cold):
 - Docker build → push to ECR → ECS Fargate task (two containers: app + ngrok sidecar)
 - Fargate = NO persistent disk, NO filesystem mounts, NO docker-compose sidecars in prod
-- Every app container automatically receives: DB_HOST=10.40.40.123, DB_PORT=5432 as plain env vars
+- Every app container automatically receives: DB_HOST=${cfg.pgHostInternalIp}, DB_PORT=5432 as plain env vars
 - Secrets (passwords, tokens, API keys) come from AWS Secrets Manager injected as individual env vars
   (e.g. DB_PASSWORD, SLACK_BOT_TOKEN, ANTHROPIC_API_KEY — NOT as files, NOT as volumes)
 - ANTHROPIC_API_KEY is injected automatically into every container
@@ -1510,7 +1520,7 @@ claudeCodePrompt rules (when eligible=false):
 - Write it as if you are briefing a developer who will paste it into Claude Code inside the repo
 - Start with: "Fix this repo for AWS ECS Fargate deployment via Tangent."
 - List each blocker with the specific file, the problem, and the exact code change needed
-- Mention Tangent's automatic env vars: DB_HOST=10.40.40.123, DB_PORT=5432, DB_PASSWORD (injected via Tangent), ANTHROPIC_API_KEY (auto-injected)
+- Mention Tangent's automatic env vars: DB_HOST=${cfg.pgHostInternalIp}, DB_PORT=5432, DB_PASSWORD (injected via Tangent), ANTHROPIC_API_KEY (auto-injected)
 - End with: "Once fixed, ask Tangent in Slack to deploy again."
 - Keep it under 400 words, very actionable
 - When eligible=true, set claudeCodePrompt to null`;

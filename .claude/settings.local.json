@@ -21,7 +21,6 @@
       "WebFetch(domain:ourtake.bakerbotts.com)",
       "Bash(rsync -avz -e \"ssh -i ~/.ssh/litgrab.pem\" --exclude='.git' --exclude='node_modules' --exclude='.env' . ubuntu@98.84.123.71:/home/ubuntu/tangent/)",
       "Bash(ssh -i ~/.ssh/litgrab.pem ubuntu@98.84.123.71 \"cd /home/ubuntu/tangent && npm run build 2>&1 | tail -5 && pm2 restart tangent && sleep 2 && pm2 status --no-color | tail -4\")",
-      "mcp__tangent__push_file",
       "Bash(ssh -i ~/.ssh/litgrab.pem ubuntu@98.84.123.71 \"cd /home/ubuntu/tangent && npm run build 2>&1 | tail -2 && pm2 restart tangent && sleep 2 && pm2 status --no-color | tail -4\")"
     ]
   }

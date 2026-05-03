@@ -9,7 +9,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
   RegisterTaskDefinitionCommand,
@@ -58,6 +58,10 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
     ecsTaskRoleArn,
     fargate,
     defaultAppPort,
+    pgHostInternalIp,
+    sharedAppSecrets,
+    ngrokAuthtokenSecretValueFrom,
+    ngrokOAuthDomains,
   } = config();
 
   // Safety: only touch the allowed cluster
@@ -85,7 +89,7 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
   // DB_PASSWORD is NOT injected here — services request it via inject_secret when
   // they need write access.  Service-supplied env vars override these defaults.
   const dbDefaults: Record<string, string> = {
-    DB_HOST: '10.40.40.123',
+    DB_HOST: pgHostInternalIp,
     DB_PORT: '5432',
   };
   const mergedEnv: Record<string, string> = { ...dbDefaults, ...env };
@@ -110,19 +114,14 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
   };
 
   // Shared cluster-wide secrets injected into every app container.
-  // All tangent/* secrets are covered by the TangentSecretsAccess IAM policy.
-  const sharedAppSecrets: Secret[] = [
-    {
-      name: 'ANTHROPIC_API_KEY',
-      valueFrom: 'arn:aws:secretsmanager:us-east-1:307048237966:secret:tangent/ANTHROPIC_API_KEY-RkgZsG',
-    },
-  ];
+  // All configured secrets should be covered by the ECS execution role policy.
+  const configuredSharedAppSecrets: Secret[] = sharedAppSecrets;
 
   // ngrok authtoken is stored in Secrets Manager and injected by ECS at runtime.
   const ngrokSecrets: Secret[] = [
     {
       name: 'NGROK_AUTHTOKEN',
-      valueFrom: 'arn:aws:secretsmanager:us-east-1:307048237966:secret:tangent/ngrok-authtoken-n5feXK',
+      valueFrom: ngrokAuthtokenSecretValueFrom,
     },
   ];
 
@@ -130,7 +129,7 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
   // sharedAppSecrets always wins (deduped by name), so the cluster-wide keys are
   // always present on every app container regardless of what was there before.
   const inheritedSecrets = await fetchExistingAppSecrets(taskFamily);
-  const sharedNames = new Set(sharedAppSecrets.map((s) => s.name));
+  const sharedNames = new Set(configuredSharedAppSecrets.map((s) => s.name));
   const extraSecrets = inheritedSecrets
     .filter((s) => !sharedNames.has(s.name ?? ''))
     // Drop secrets whose ARN doesn't reference a tangent/ path — the ECS execution
@@ -146,7 +145,7 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
       );
       return false;
     });
-  const appSecrets = [...sharedAppSecrets, ...extraSecrets];
+  const appSecrets = [...configuredSharedAppSecrets, ...extraSecrets];
   logger.info({ action: 'deploy:app_secrets', total: appSecrets.length }, 'App container secrets resolved');
 
   const appContainer: ContainerDefinition = {
@@ -170,7 +169,7 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
       '--log=stdout',
       '--log-format=json',
       '--oauth=google',
-      '--oauth-allow-domain=impiricus.com',
+      ...ngrokOAuthDomains.flatMap((domain) => ['--oauth-allow-domain', domain]),
     ],
     secrets: ngrokSecrets,
     logConfiguration: ngrokLogConfig,
@@ -310,7 +309,9 @@ function saveNgrokUrl(repo: string, url: string): void {
   try {
     const urls = loadNgrokUrls();
     urls[repo] = url;
-    writeFileSync(NGROK_URLS_FILE, JSON.stringify(urls, null, 2));
+    const tmp = `${NGROK_URLS_FILE}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(tmp, JSON.stringify(urls, null, 2));
+    renameSync(tmp, NGROK_URLS_FILE);
   } catch (err) {
     logger.warn({ action: 'deploy:ngrok_url_save_failed', err }, 'Could not persist ngrok URL');
   }

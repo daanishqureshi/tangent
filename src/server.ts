@@ -6,12 +6,14 @@
  */
 
 import Fastify from 'fastify';
+import { parse as parseQueryString } from 'node:querystring';
 import { logger } from './utils/logger.js';
 import { healthRoutes } from './routes/health.js';
 import { deployRoutes } from './routes/deploy.js';
 import { teardownRoutes } from './routes/teardown.js';
 import { statusRoutes } from './routes/status.js';
 import { listRoutes } from './routes/list.js';
+import { dashboardRoutes } from './routes/dashboard.js';
 
 export async function buildServer() {
   const app = Fastify({
@@ -35,6 +37,9 @@ export async function buildServer() {
       done(err as Error, undefined);
     }
   });
+  app.addContentTypeParser('application/x-www-form-urlencoded', { parseAs: 'string' }, (_req, body, done) => {
+    done(null, parseQueryString(body as string));
+  });
 
   // ── Routes ──────────────────────────────────────────────────────────────────
   await app.register(healthRoutes);
@@ -42,6 +47,7 @@ export async function buildServer() {
   await app.register(teardownRoutes);
   await app.register(statusRoutes);
   await app.register(listRoutes);
+  await app.register(dashboardRoutes);
 
   // ── 404 handler ─────────────────────────────────────────────────────────────
   app.setNotFoundHandler((_req, reply) => {

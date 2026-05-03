@@ -1,7 +1,7 @@
 /**
  * routes/list.ts — GET /list
  *
- * Returns all running vibecode-* services with their status and URLs.
+ * Returns all running tangent-* services with their status and URLs.
  */
 
 import type { FastifyInstance } from 'fastify';

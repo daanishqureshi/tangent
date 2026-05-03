@@ -12,7 +12,7 @@ import {
   SecretsManagerClient,
   GetSecretValueCommand,
 } from '@aws-sdk/client-secrets-manager';
-import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { resolve } from 'path';
 import { logger } from './utils/logger.js';
@@ -81,6 +81,19 @@ export interface Config {
   pgAdminUrl: string;
   pgQueryUrl: string;
   pgHostInternalIp: string; // for building per-service connection strings
+
+  // Dashboard / HTTP API auth
+  dashboard: {
+    username: string;
+    password: string;
+    apiToken: string;
+  };
+
+  // Runtime infrastructure facts used by deploys and prompts
+  ngrokOAuthDomains: string[];
+  secretsManagerPrefix: string;
+  sharedAppSecrets: Array<{ name: string; valueFrom: string }>;
+  ngrokAuthtokenSecretValueFrom: string;
 
   // Server
   port: number;
@@ -182,6 +195,31 @@ function optionalEnv(name: string, fallback: string): string {
   return process.env[name] ?? fallback;
 }
 
+function optionalCsvEnv(name: string, fallback: string): string[] {
+  return optionalEnv(name, fallback)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function parseSharedAppSecrets(raw: string): Array<{ name: string; valueFrom: string }> {
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const eq = entry.indexOf('=');
+      if (eq === -1) {
+        throw new Error(`Invalid SHARED_APP_SECRETS entry "${entry}" — expected NAME=valueFrom`);
+      }
+      return {
+        name: entry.slice(0, eq).trim(),
+        valueFrom: entry.slice(eq + 1).trim(),
+      };
+    })
+    .filter((s) => s.name && s.valueFrom);
+}
+
 async function fetchSecret(client: SecretsManagerClient, secretName: string): Promise<string> {
   const cmd = new GetSecretValueCommand({ SecretId: secretName });
   const response = await client.send(cmd);
@@ -250,6 +288,18 @@ export async function loadConfig(): Promise<Config> {
   const pgAdminUrl       = optionalEnv('TANGENT_DB_ADMIN_URL', '');
   const pgQueryUrl       = optionalEnv('TANGENT_DB_QUERY_URL', '');
   const pgHostInternalIp = optionalEnv('TANGENT_DB_HOST_INTERNAL_IP', '10.40.40.123');
+  const dashboardUsername = optionalEnv('DASHBOARD_USERNAME', 'daanish');
+  const dashboardApiToken = optionalEnv('DASHBOARD_API_TOKEN', '');
+  const ngrokOAuthDomains = optionalCsvEnv('NGROK_OAUTH_DOMAINS', 'impiricus.com,docupdate.io');
+  const secretsManagerPrefix = optionalEnv('SECRETS_MANAGER_PREFIX', 'tangent/').replace(/\/?$/, '/');
+  const sharedAppSecrets = parseSharedAppSecrets(optionalEnv(
+    'SHARED_APP_SECRETS',
+    'ANTHROPIC_API_KEY=arn:aws:secretsmanager:us-east-1:307048237966:secret:tangent/ANTHROPIC_API_KEY-RkgZsG',
+  ));
+  const ngrokAuthtokenSecretValueFrom = optionalEnv(
+    'NGROK_AUTHTOKEN_SECRET_VALUE_FROM',
+    'arn:aws:secretsmanager:us-east-1:307048237966:secret:tangent/ngrok-authtoken-n5feXK',
+  );
 
   const port = parseInt(optionalEnv('PORT', '3000'), 10);
   const host = optionalEnv('HOST', '127.0.0.1');
@@ -265,6 +315,7 @@ export async function loadConfig(): Promise<Config> {
   let slackToken: string;
 
   let slackAppToken: string;
+  let dashboardPassword: string;
 
   if (LOCAL_DEV) {
     logger.info({ action: 'config:local_dev' }, 'LOCAL_DEV=true — reading secrets from env vars');
@@ -273,12 +324,14 @@ export async function loadConfig(): Promise<Config> {
     anthropicApiKey = requireEnv('ANTHROPIC_API_KEY');
     slackToken      = optionalEnv('SLACK_TOKEN', '');
     slackAppToken   = optionalEnv('SLACK_APP_TOKEN', '');
+    dashboardPassword = optionalEnv('DASHBOARD_PASSWORD', 'tangent-local');
   } else {
     const secretNgrokKey     = requireEnv('SECRET_NGROK_AUTHTOKEN');
     const secretGithubKey    = requireEnv('SECRET_GITHUB_TOKEN');
     const secretAnthropicKey = requireEnv('SECRET_ANTHROPIC_KEY');
     const secretSlackKey     = requireEnv('SECRET_SLACK_TOKEN');
     const secretSlackAppKey  = requireEnv('SECRET_SLACK_APP_TOKEN');
+    const secretDashboardPassword = optionalEnv('SECRET_DASHBOARD_PASSWORD', '');
 
     logger.info({ action: 'config:load_secrets' }, 'Fetching secrets from Secrets Manager');
     const smClient = new SecretsManagerClient({ region: awsRegion });
@@ -290,6 +343,9 @@ export async function loadConfig(): Promise<Config> {
       fetchSecret(smClient, secretSlackKey),
       fetchSecret(smClient, secretSlackAppKey),
     ]);
+    dashboardPassword = secretDashboardPassword
+      ? await fetchSecret(smClient, secretDashboardPassword)
+      : optionalEnv('DASHBOARD_PASSWORD', '');
   }
 
   // Derive ECR URI from the execution role ARN (account ID is in position 4)
@@ -327,6 +383,15 @@ export async function loadConfig(): Promise<Config> {
     pgAdminUrl,
     pgQueryUrl,
     pgHostInternalIp,
+    dashboard: {
+      username: dashboardUsername,
+      password: dashboardPassword,
+      apiToken: dashboardApiToken,
+    },
+    ngrokOAuthDomains,
+    secretsManagerPrefix,
+    sharedAppSecrets,
+    ngrokAuthtokenSecretValueFrom,
     port,
     host,
     workspaceDir,

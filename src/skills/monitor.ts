@@ -1,7 +1,7 @@
 /**
  * skills/monitor.ts
  *
- * Check the health of all vibecode-* ECS services and alert Slack when
+ * Check the health of all tangent-* ECS services and alert Slack when
  * a service has been degraded for longer than the threshold.
  *
  * Called by cron/health-check.ts every 5 minutes.

@@ -23,7 +23,7 @@
 13. [Identity, access control & approvals](#identity-access-control--approvals)
 14. [Memory & personalisation](#memory--personalisation)
 15. [Self-healing: post-deploy auto-fix](#self-healing-post-deploy-auto-fix)
-16. [The MCP server (`mcp/`)](#the-mcp-server-mcp)
+16. [Dashboard](#dashboard)
 17. [Configuration & secrets](#configuration--secrets)
 18. [Local development](#local-development)
 19. [Production deployment (EC2 + PM2)](#production-deployment-ec2--pm2)
@@ -41,7 +41,6 @@ Tangent is a TypeScript service that combines:
 - **A Claude-powered router** — every Slack message goes to Claude Sonnet 4.6 with a tool-use schema; Claude either replies conversationally or calls one of ~20 DevOps tools.
 - **A skill layer** — discrete units of work (`build`, `deploy`, `tunnel`, `teardown`, `monitor`, `scan`, `discover`) that talk to AWS, Docker, GitHub, ngrok.
 - **Two cron jobs** — health-check every 5 min, CVE scan nightly at 02:00 UTC.
-- **A standalone MCP server** (`mcp/`) — lets developers call Tangent from Claude Code / Cursor without opening any ports on EC2.
 
 The unifying idea: **the LLM is the router.** There is no separate intent-classification step. Claude looks at the conversation history, the user's identity, the available tools, and decides what to do.
 
@@ -53,7 +52,7 @@ The unifying idea: **the LLM is the router.** There is no separate intent-classi
                                 ┌──────────────────────────────┐
                                 │            Slack             │
                                 │  (DMs, #tangent-deployments, │
-                                │      #tangent-mcp, threads)  │
+                                │          threads)            │
                                 └───────┬───────────────▲──────┘
                                         │ Socket Mode   │ chat.postMessage / chat.update
                                         │ (xapp-/xoxb-) │
@@ -262,12 +261,6 @@ tangent/
 │       ├── constants.ts          SERVICE_PREFIX, ALLOWED_CLUSTER, NGROK_IMAGE, timeouts
 │       └── safety.ts             assertAllowedCluster() — hard guard before any ECS write
 │
-├── mcp/                          ← Standalone MCP server (separate package)
-│   ├── src/index.ts              MCP tool defs + handlers (stdio transport)
-│   ├── src/slack.ts              postAndWait — posts to #tangent-mcp, polls thread
-│   ├── README.md                 setup for Claude Code / Cursor
-│   └── package.json
-│
 ├── config/                       ← Persistent state (committed to git)
 │   ├── allowed_users.json        Slack user IDs who may talk to Tangent
 │   ├── people.json               long-term memory notes per Slack user ID
@@ -302,7 +295,6 @@ tangent/
 | Cron        | `node-cron` 3                                                   |
 | Logging     | `pino` + `pino-pretty`                                          |
 | Process mgr | PM2 (`pm2.config.cjs`)                                          |
-| MCP         | `@modelcontextprotocol/sdk` 1.10 (stdio transport)              |
 
 ---
 
@@ -339,7 +331,6 @@ Conversations cap at **12 turns**. Every historical user message is rewritten wi
                                      ▼
                   ┌──────────────────────────────────────┐
                   │ Resolve real Slack user ID           │
-                  │ (incl. MCP-USER prefix from MCP bot) │
                   └──────────────────┬───────────────────┘
                                      ▼
                   ┌──────────────────────────────────────┐
@@ -545,17 +536,17 @@ Returns suggestions, surfaced AWS errors (never swallowed), and a `missing` list
 
 ## HTTP API
 
-A second interface, useful for scripts, CI hooks, and the smoke test. All routes register under `src/server.ts`.
+A second interface, useful for scripts, CI hooks, and the smoke test. All routes register under `src/server.ts`. Mutating routes require Dashboard Basic Auth or `Authorization: Bearer $DASHBOARD_API_TOKEN`.
 
 | Method | Path             | Body / Params                                | Behaviour                                                                                                                       |
 |--------|------------------|----------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------|
-| GET    | `/health`        | —                                            | `{ status, uptime, services }` — counts running `vibecode-*` services as a liveness signal.                                     |
+| GET    | `/health`        | —                                            | `{ status, uptime, services }` — counts running `tangent-*` services as a liveness signal.                                      |
 | POST   | `/deploy`        | `{ repo, branch?, port? }`                   | Build → deploy → return **202** immediately → background tunnel poll + `notifyDeployed`. JSON-schema validates `repo` shape.    |
 | POST   | `/teardown`      | `{ repo }`                                   | Synchronous. Calls `teardownSkill` and `notifyTeardown`.                                                                        |
 | GET    | `/status/:repo`  | `:repo`                                      | ECS service state + latest task def + 10 s tunnel probe.                                                                        |
 | GET    | `/list`          | —                                            | All running `tangent-*` services with task counts and creation timestamps.                                                      |
 
-The Fastify instance uses `pino` as its logger and a strict JSON content-type parser. All errors are funneled through a single error handler that surfaces `statusCode` from the underlying error.
+The Fastify instance uses `pino` as its logger and strict JSON/form content-type parsers. All errors are funneled through a single error handler that surfaces `statusCode` from the underlying error.
 
 ---
 
@@ -687,46 +678,11 @@ The fix is intentionally conservative: minimal change, no refactoring, no infra/
 
 ---
 
-## The MCP server (`mcp/`)
+## Dashboard
 
-A separate npm package — `mcp/` — that lets developers call Tangent from **Claude Code** or **Cursor** without opening any inbound ports on EC2.
+Tangent exposes a VPC-only dashboard at `/dashboard`. It is protected with HTTP Basic Auth and is intended to be viewed while connected to the VPN.
 
-```
-   ┌─────────────────────┐
-   │ Claude Code / Cursor│
-   └─────────┬───────────┘
-             │  stdio
-             ▼
-   ┌─────────────────────┐
-   │  tangent-mcp        │  (this folder)
-   │  Node MCP server    │
-   └─────────┬───────────┘
-             │  Slack chat.postMessage as the developer
-             ▼
-   ┌─────────────────────┐
-   │  #tangent-mcp       │
-   │  channel in Slack   │
-   └─────────┬───────────┘
-             │  app_mention event (Socket Mode)
-             ▼
-   ┌─────────────────────┐
-   │  Tangent on EC2     │
-   │  (no ports opened)  │
-   └─────────┬───────────┘
-             │  thread reply
-             ▼
-   ┌─────────────────────┐
-   │  tangent-mcp polls  │
-   │  the thread, returns│
-   │  the final result   │
-   └─────────────────────┘
-```
-
-The MCP server posts the request _as the developer_ (using their own `xoxp-` user token) so Tangent's normal identity / access / approval rules apply unchanged. With a bot token (`xoxb-`), the `[MCP-USER: <id>]` prefix carries the real caller's identity.
-
-Polling logic recognises terminal markers (`✅`, `❌`, `⚠️`, `🛑`) to know when Tangent is done updating its message. Deploys time out after 3 min (Daanish has to approve), reads after 60 s.
-
-See `mcp/README.md` for setup.
+The dashboard shows ECS services, development Secrets Manager entries, recent audit events, and forms to create/update secrets or inject them into ECS services. Secret values are write-only: after submit, Tangent shows only the secret name and audit metadata.
 
 ---
 
@@ -768,11 +724,14 @@ SECRET_GITHUB_TOKEN=tangent/github-token
 SECRET_ANTHROPIC_KEY=tangent/ANTHROPIC_API_KEY
 SECRET_SLACK_TOKEN=tangent/slack-bot-token       # xoxb-
 SECRET_SLACK_APP_TOKEN=tangent/slack-app-token   # xapp- (Socket Mode)
+SECRET_DASHBOARD_PASSWORD=tangent/dashboard-password
+NGROK_OAUTH_DOMAINS=impiricus.com,docupdate.io
+SECRETS_MANAGER_PREFIX=tangent/
 ```
 
-Set `LOCAL_DEV=true` to skip Secrets Manager entirely and read secrets from regular env vars (`ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, `NGROK_AUTHTOKEN`, `SLACK_TOKEN`, `SLACK_APP_TOKEN`). Useful for running on a Mac without AWS credentials.
+Set `LOCAL_DEV=true` to skip Secrets Manager entirely and read secrets from regular env vars (`ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, `NGROK_AUTHTOKEN`, `SLACK_TOKEN`, `SLACK_APP_TOKEN`, `DASHBOARD_PASSWORD`). Useful for running on a Mac without AWS credentials.
 
-The cluster-wide `ANTHROPIC_API_KEY` ARN is **hard-coded** into `skills/deploy.ts` and injected into every app container. This means every deployed Impiricus service has Claude API access by default without any extra setup.
+Cluster-wide app secrets are configured via `SHARED_APP_SECRETS` and injected into every app container. By default this includes `ANTHROPIC_API_KEY`, so deployed Impiricus services can use Claude without extra setup.
 
 ---
 
@@ -805,13 +764,6 @@ npm run typecheck
 ```
 
 The Slack bot connects via Socket Mode — **no public URL is needed**. As long as your `SLACK_APP_TOKEN` is valid, mentions in Slack will reach your local process.
-
-To build the MCP server:
-
-```bash
-npm run build:mcp        # → mcp/dist/index.js
-npm run build:all        # main + mcp together
-```
 
 ---
 
@@ -886,8 +838,6 @@ If you want a one-line index of every important file:
 | `src/utils/constants.ts`                      | 37    | Service prefix, allowed cluster, ngrok image, timeouts           |
 | `src/utils/exec.ts`                           | 39    | `execFile` wrapper, 50 MB buffer, 5 min default timeout          |
 | `src/utils/logger.ts`                         | 24    | pino + pino-pretty                                               |
-| `mcp/src/index.ts`                            | 230   | MCP server (stdio) — exposes 8 tools                             |
-| `mcp/src/slack.ts`                            | 137   | postAndWait — post + poll #tangent-mcp thread                    |
 | `pm2.config.cjs`                              | 43    | Production process manager config                                |
 | `scripts/setup.sh`                            | 197   | Idempotent EC2 bootstrap                                         |
 | `scripts/iam-policy.json`                     | 67    | Tangent's IAM permissions                                        |

@@ -8,20 +8,19 @@ import {
 } from '@aws-sdk/client-ecs';
 import { ecsClient } from '../services/aws.js';
 import { config } from '../config.js';
+import { SERVICE_PREFIX } from '../utils/constants.js';
 
 export async function healthRoutes(app: FastifyInstance): Promise<void> {
   app.get('/health', async (_req, reply) => {
     const { ecsClusterName } = config();
 
-    // Count running vibecode services as a lightweight liveness check
+    // Count Tangent-managed services as a lightweight liveness check
     let serviceCount = 0;
     try {
       const result = await ecsClient().send(
         new ListServicesCommand({ cluster: ecsClusterName, maxResults: 100 }),
       );
-      serviceCount = (result.serviceArns ?? []).filter((arn) =>
-        arn.includes('vibecode-'),
-      ).length;
+      serviceCount = (result.serviceArns ?? []).filter((arn) => arn.includes(SERVICE_PREFIX)).length;
     } catch {
       // Non-fatal — still return healthy
     }

@@ -29,6 +29,9 @@ import { teardownSkill } from '../skills/teardown.js';
 import { scanSkill } from '../skills/scan.js';
 import { discoverSkill } from '../skills/discover.js';
 import { listAllRepos, inspectRepo, pushFile, readRepoFile, listCommits, editFile } from './github.js';
+import { listSecrets, putSecret, injectSecretIntoService } from './environment.js';
+import { recordAuditEvent } from './audit.js';
+import { APPROVER_ID } from './policy.js';
 import { logger } from '../utils/logger.js';
 
 // ─── App singleton ────────────────────────────────────────────────────────────
@@ -72,9 +75,6 @@ function sanitizeSlackText(text: string): string {
 
 /** The channel where all deploy/teardown notifications and approvals live. */
 const DEPLOY_CHANNEL = 'C0AQZ16BKAN'; // #tangent-deployments
-
-/** Only this user can approve deploys and initiate/approve teardowns. */
-const APPROVER_ID = 'U07EU7KSG3U'; // Daanish — the GOAT
 
 // ─── Pending confirmation store ───────────────────────────────────────────────
 //
@@ -283,18 +283,12 @@ export function initSlackBot(): void {
     const threadTs  = ('thread_ts' in event && event.thread_ts) ? String(event.thread_ts) : messageTs;
     const rawText   = typeof event.text === 'string' ? event.text : '';
 
-    // MCP bot-token messages carry [MCP-USER: USERID] so Tangent knows the real caller.
-    // Extract it and use it as userId — this lets the normal identity/access system
-    // work unchanged even when the message was posted by the bot on someone's behalf.
-    const mcpMatch = rawText.match(/^\[MCP-USER:\s*([A-Z0-9]+)\]/);
-    const userId = mcpMatch
-      ? mcpMatch[1]
-      : (typeof event.user === 'string' ? event.user : undefined);
+    const userId = typeof event.user === 'string' ? event.user : undefined;
 
-    // Strip the MCP prefix and Tangent's own @mention, but preserve any
-    // *other* user mentions in the body — they're targets Claude may need
-    // (e.g. "add @Sam" must keep Sam's <@USERID> intact).
-    const text = sanitizeSlackText(rawText.replace(/^\[MCP-USER:\s*[A-Z0-9]+\]\s*/, ''));
+    // Strip Tangent's own @mention, but preserve any *other* user mentions in
+    // the body — they're targets Claude may need (e.g. "add @Sam" must keep
+    // Sam's <@USERID> intact).
+    const text = sanitizeSlackText(rawText);
     if (!text) return;
     await route({ channel, threadTs, userId, client, text, source: 'mention', messageTs });
   });
@@ -650,7 +644,7 @@ async function _routeInner(
     const { command, reason, timeout_seconds } = call.input as { command: string; reason: string; timeout_seconds?: number };
     const timeoutS = timeout_seconds ?? 60;
     const prompt = [
-      `🖥️ *About to run a shell command on the Tangent EC2 (10.40.40.123)*`,
+      `🖥️ *About to run a shell command on the Tangent EC2 (${config().pgHostInternalIp})*`,
       `*Reason:* ${reason}`,
       `*Timeout:* ${timeoutS}s`,
       '',
@@ -2124,104 +2118,16 @@ async function handleInjectSecret(
   input: { repo: string; secret_name: string },
   convKey: string,
 ): Promise<string> {
-  let { secret_name } = input;
-  const { repo } = input;
-
-  // Enforce tangent/ prefix — the ECS execution role IAM policy only grants
-  // GetSecretValue on tangent/*. If the caller passes a bare name, auto-prefix.
-  if (!secret_name.startsWith('tangent/')) {
-    secret_name = `tangent/${secret_name}`;
-  }
-
+  const { repo, secret_name } = input;
   const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Wiring \`${secret_name}\` into \`${repo}\`...`);
 
   try {
-    const { DescribeSecretCommand, ListSecretsCommand: _LS } = await import('@aws-sdk/client-secrets-manager');
-    const {
-      RegisterTaskDefinitionCommand,
-      UpdateServiceCommand,
-      ListTaskDefinitionsCommand,
-      DescribeTaskDefinitionCommand,
-    } = await import('@aws-sdk/client-ecs');
-    const { smClient } = await import('./aws.js');
-    const { ecsClient } = await import('./aws.js');
-    const { SERVICE_PREFIX, TASK_FAMILY_PREFIX } = await import('../utils/constants.js');
-
-    // 1. Resolve the secret ARN from Secrets Manager
-    const secretMeta = await smClient().send(new DescribeSecretCommand({ SecretId: secret_name }));
-    const secretArn = secretMeta.ARN;
-    if (!secretArn) throw new Error(`Secret "${secret_name}" not found in Secrets Manager`);
-
-    // 2. Fetch the current task definition
-    const taskFamily = `${TASK_FAMILY_PREFIX}${repo}`;
-    const listResult = await ecsClient().send(new ListTaskDefinitionsCommand({
-      familyPrefix: taskFamily,
-      sort: 'DESC',
-      maxResults: 1,
-      status: 'ACTIVE',
-    }));
-    const latestArn = listResult.taskDefinitionArns?.[0];
-    if (!latestArn) throw new Error(`No active task definition found for "${repo}"`);
-
-    const descResult = await ecsClient().send(new DescribeTaskDefinitionCommand({ taskDefinition: latestArn }));
-    const taskDef = descResult.taskDefinition;
-    if (!taskDef) throw new Error('Could not describe task definition');
-
-    const containers = taskDef.containerDefinitions ?? [];
-    const appContainer = containers.find((c) => c.name === 'app');
-    if (!appContainer) throw new Error('No "app" container found in task definition');
-
-    // 3. Add/update the secret in the app container (dedupe by name).
-    // The env var name exposed to the app should be the bare key (e.g. ASANA_PAT),
-    // NOT the full Secrets Manager path (tangent/ASANA_PAT). Strip the prefix.
-    const envVarName = secret_name.replace(/^tangent\//, '');
-    const existingSecrets = appContainer.secrets ?? [];
-    const filtered = existingSecrets
-      // Remove any existing entry with the same env var name (exact match)
-      .filter((s) => s.name !== envVarName)
-      // Also remove any entry whose env var name matches with tangent/ prefix
-      // (from before the prefix-stripping fix)
-      .filter((s) => s.name !== secret_name)
-      // Drop ALL secrets whose ARN references a non-tangent/ path — these
-      // cause AccessDeniedException at container startup because the ECS
-      // execution role only has GetSecretValue on tangent/*.
-      .filter((s) => {
-        const arn = s.valueFrom ?? '';
-        if (arn.includes(':secret:tangent/')) return true;
-        logger.warn(
-          { action: 'inject_secret:drop_unprefixed', name: s.name, arn },
-          `Dropping inherited secret "${s.name}" — ARN outside tangent/ prefix`,
-        );
-        return false;
-      });
-    appContainer.secrets = [...filtered, { name: envVarName, valueFrom: secretArn }];
-
-    // 4. Re-register the task definition with the new secret
-    const registerResult = await ecsClient().send(new RegisterTaskDefinitionCommand({
-      family:                   taskDef.family,
-      containerDefinitions:     containers,
-      networkMode:              taskDef.networkMode,
-      requiresCompatibilities:  taskDef.requiresCompatibilities,
-      cpu:                      taskDef.cpu,
-      memory:                   taskDef.memory,
-      executionRoleArn:         taskDef.executionRoleArn,
-      taskRoleArn:              taskDef.taskRoleArn ?? config().ecsTaskRoleArn,
-      volumes:                  taskDef.volumes,
-    }));
-    const newTaskDefArn = registerResult.taskDefinition?.taskDefinitionArn;
-    if (!newTaskDefArn) throw new Error('Task definition re-registration returned no ARN');
-
-    // 5. Force a new deployment so the running container picks up the secret
-    const { ecsClusterName } = config();
-    await ecsClient().send(new UpdateServiceCommand({
-      cluster:            ecsClusterName,
-      service:            `${SERVICE_PREFIX}${repo}`,
-      taskDefinition:     newTaskDefArn,
-      forceNewDeployment: true,
-    }));
-
-    const result = `Successfully wired secret "${secret_name}" into service "${repo}". A new ECS deployment was triggered.`;
-    await update(ctx.client, ctx.channel, ts, `✓ injected \`${secret_name}\` into \`${repo}\``);
+    const injected = await injectSecretIntoService(
+      { repo, secretName: secret_name },
+      { actor: ctx.userId ?? 'unknown', surface: 'slack' },
+    );
+    const result = `Successfully wired secret "${injected.secretName}" into service "${repo}" as env var "${injected.envVarName}". A new ECS deployment was triggered.`;
+    await update(ctx.client, ctx.channel, ts, `✓ injected \`${injected.secretName}\` into \`${repo}\` as \`${injected.envVarName}\``);
     return result;
   } catch (err) {
     const result = `Failed to inject secret "${secret_name}" into "${repo}": ${err instanceof Error ? err.message : String(err)}`;
@@ -2231,19 +2137,7 @@ async function handleInjectSecret(
 }
 
 async function fetchListSecrets(): Promise<string> {
-  const { ListSecretsCommand } = await import('@aws-sdk/client-secrets-manager');
-  const { smClient } = await import('./aws.js');
-
-  const secrets: { name: string; description?: string }[] = [];
-  let nextToken: string | undefined;
-  do {
-    const r = await smClient().send(new ListSecretsCommand({ NextToken: nextToken, MaxResults: 100 }));
-    for (const s of r.SecretList ?? []) {
-      if (s.Name) secrets.push({ name: s.Name, description: s.Description });
-    }
-    nextToken = r.NextToken;
-  } while (nextToken);
-
+  const secrets = await listSecrets();
   if (secrets.length === 0) return 'No secrets found in Secrets Manager.';
 
   const lines = secrets.map((s) =>
@@ -2257,39 +2151,13 @@ async function handlePutSecret(
   input: { name: string; value: string; description?: string },
   convKey: string,
 ): Promise<string> {
-  // Enforce tangent/ prefix — the ECS execution role IAM policy only grants
-  // GetSecretValue on tangent/*. Secrets without this prefix cause
-  // AccessDeniedException at container startup.
-  if (!input.name.startsWith('tangent/')) {
-    input = { ...input, name: `tangent/${input.name}` };
-  }
-
-  const { CreateSecretCommand, PutSecretValueCommand, ResourceExistsException } = await import('@aws-sdk/client-secrets-manager');
-  const { smClient } = await import('./aws.js');
-
   const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Writing \`${input.name}\` to Secrets Manager...`);
 
   try {
-    // Try create first; if it already exists, update the value instead
-    try {
-      await smClient().send(new CreateSecretCommand({
-        Name: input.name,
-        SecretString: input.value,
-        Description: input.description,
-      }));
-    } catch (err) {
-      if (err instanceof ResourceExistsException || (err as { name?: string }).name === 'ResourceExistsException') {
-        await smClient().send(new PutSecretValueCommand({
-          SecretId: input.name,
-          SecretString: input.value,
-        }));
-      } else {
-        throw err;
-      }
-    }
-
-    const result = `Successfully saved secret "${input.name}" to Secrets Manager.${input.description ? ` Description: ${input.description}` : ''}`;
-    await update(ctx.client, ctx.channel, ts, `✓ saved \`${input.name}\``);
+    const saved = await putSecret(input, { actor: ctx.userId ?? 'unknown', surface: 'slack' });
+    const verb = saved.created ? 'created' : 'updated';
+    const result = `Successfully ${verb} secret "${saved.name}" in Secrets Manager.${input.description ? ` Description: ${input.description}` : ''}`;
+    await update(ctx.client, ctx.channel, ts, `✓ ${verb} \`${saved.name}\``);
     return result;
   } catch (err) {
     const result = `Failed to save secret "${input.name}": ${err instanceof Error ? err.message : String(err)}`;
@@ -2595,6 +2463,22 @@ async function handleBash(
     },
     'Bash command finished',
   );
+
+  await recordAuditEvent({
+    action: 'bash:exec',
+    actor: ctx.userId ?? 'unknown',
+    surface: 'slack',
+    metadata: {
+      command,
+      reason,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      durationMs,
+      stdoutBytes: result.stdout.length,
+      stderrBytes: result.stderr.length,
+    },
+  });
 
   // Build a user-facing reply.  Show stdout / stderr / exit code, and put
   // long output in code fences for readability.
