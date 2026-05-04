@@ -20,15 +20,20 @@ import { initGithubClient } from './services/github.js';
 import { initSlackClient } from './services/slack.js';
 import { initSlackBot, startSlackBot } from './services/slack-bot.js';
 import { initAiClient } from './services/ai.js';
+import { runAppMigrations } from './services/db-migrations.js';
+import { hydrateRuntimeStateFromDb } from './services/state.js';
 import { buildServer } from './server.js';
 import { startHealthCheckCron } from './cron/health-check.js';
 import { startCveScanCron } from './cron/cve-scan.js';
+import { startMemorySummarizeCron } from './cron/memory-summarize.js';
 import { logger } from './utils/logger.js';
 
 async function main(): Promise<void> {
   // 1 + 2 + 3 — Load env + fetch secrets + validate
   await loadConfig();
   const cfg = config();
+  await runAppMigrations();
+  await hydrateRuntimeStateFromDb();
 
   // 4 — Initialize clients
   initAwsClients();
@@ -55,6 +60,7 @@ async function main(): Promise<void> {
   // 8 — Start cron jobs
   startHealthCheckCron();
   startCveScanCron();
+  startMemorySummarizeCron();
 
   // 9 — Banner
   logger.info(

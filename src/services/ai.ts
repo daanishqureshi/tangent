@@ -11,6 +11,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { config } from '../config.js';
+import { buildMemoryContextForPrompt } from './memory-context.js';
 import { logger } from '../utils/logger.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -55,6 +56,17 @@ export type AgentToolCall =
 export type AgentResponse =
   | { type: 'tool'; call: AgentToolCall }
   | { type: 'text'; text: string };
+
+export interface MemoryCandidate {
+  kind: 'person_fact' | 'preference' | 'project_context' | 'decision' | 'open_loop' | 'infra_fact';
+  subject_type: 'user' | 'repo' | 'service' | 'team' | 'global';
+  subject_id: string;
+  content: string;
+  confidence: number;
+  importance: number;
+  source_message_ids: number[];
+  expires_at?: string | null;
+}
 
 /**
  * Thrown by buildToolCall when Claude emits a tool_use whose required fields
@@ -547,16 +559,9 @@ const TOOLS: Anthropic.Tool[] = [
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
-function buildSystemPrompt(): string {
+async function buildSystemPrompt(message?: string): Promise<string> {
   const cfg = config();
-  const { peopleNotes } = cfg;
-  const peopleSection = peopleNotes.length > 0
-    ? '\n\n*Memories — what you know about specific people:*\n' +
-      '*This section is your long-term memory. It is updated automatically as you learn things. Trust it.*\n' +
-      peopleNotes.map((p) =>
-        `\n*${p.name}* (${p.id}):\n` + p.notes.map((n) => `  - ${n}`).join('\n')
-      ).join('\n')
-    : '';
+  const memorySection = await buildMemoryContextForPrompt(message);
   const infraSection = [
     '\n\n*Current Tangent infrastructure facts (from runtime config):*',
     `- ECS cluster: ${cfg.ecsClusterName} (${cfg.awsRegion})`,
@@ -565,7 +570,7 @@ function buildSystemPrompt(): string {
     `- Deployed app DB host/port: ${cfg.pgHostInternalIp}:5432`,
     `- Ngrok OAuth domains: ${cfg.ngrokOAuthDomains.join(', ')}`,
   ].join('\n');
-  return SYSTEM_PROMPT_BASE + infraSection + peopleSection;
+  return SYSTEM_PROMPT_BASE + infraSection + memorySection;
 }
 
 const SYSTEM_PROMPT_BASE = `You are *Tangent* — the AI version of Chris Tan, Impiricus's Employee #2 and DevOps lead.
@@ -786,10 +791,11 @@ export async function processMessage(
       { role: 'user', content: message },
     ];
 
+    const systemPrompt = await buildSystemPrompt(message);
     const response = await withRetry(() => client().messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1024,
-      system: buildSystemPrompt(),
+      system: systemPrompt,
       tools: TOOLS,
       messages,
     }), 'processMessage');
@@ -838,6 +844,51 @@ export async function processMessage(
     logger.error({ action: 'ai:process_message:failed', err }, 'processMessage failed');
     return { type: 'text', text: 'Something went wrong on my end — please try again.' };
   }
+}
+
+export async function summarizeMemories(input: {
+  windowStart: string;
+  windowEnd: string;
+  messages: Array<{ id: number; role: string; slackUserId?: string | null; text: string; createdAt: string }>;
+  existingMemories: Array<{ id: number; kind: string; subject_type: string; subject_id: string; content: string }>;
+}): Promise<MemoryCandidate[]> {
+  if (input.messages.length === 0) return [];
+
+  const payload = JSON.stringify(input, null, 2).slice(0, 80_000);
+  const response = await withRetry(() => client().messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 4096,
+    system: [
+      'You summarize Tangent conversation logs into durable operational memories.',
+      'Return ONLY valid JSON with shape: {"memories":[...]}',
+      'Only create memories that will likely matter later.',
+      'Do not store secrets, passwords, tokens, or raw command output.',
+      'Every memory must cite source_message_ids from the input.',
+      'Deduplicate against existingMemories.',
+    ].join('\n'),
+    messages: [{
+      role: 'user',
+      content: `Create durable memory candidates for this window. JSON input:\n${payload}`,
+    }],
+  }), 'summarizeMemories');
+
+  const textBlock = response.content.find((b) => b.type === 'text');
+  const raw = textBlock?.type === 'text' ? textBlock.text.trim() : '{"memories":[]}';
+  const parsed = JSON.parse(raw.replace(/^```json\s*/i, '').replace(/```$/i, '')) as { memories?: MemoryCandidate[] };
+  return (parsed.memories ?? [])
+    .filter((m) => m.content && Array.isArray(m.source_message_ids))
+    .map((m) => ({
+      ...m,
+      confidence: clampNumber(m.confidence, 0, 1, 0.7),
+      importance: Math.round(clampNumber(m.importance, 1, 10, 3)),
+      source_message_ids: m.source_message_ids.filter((id) => Number.isFinite(id)),
+    }));
+}
+
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
 }
 
 function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCall | null {
@@ -1096,10 +1147,11 @@ export async function synthesizeToolResult(
       },
     ];
 
+    const systemPrompt = await buildSystemPrompt(userMessage);
     const response = await withRetry(() => client().messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1024,
-      system: buildSystemPrompt(),
+      system: systemPrompt,
       tools: TOOLS,
       messages,
     }), 'synthesizeToolResult');
@@ -1187,10 +1239,11 @@ export async function continueAfterTool(
       });
     });
 
+    const systemPrompt = await buildSystemPrompt(userMessage);
     const response = await withRetry(() => client().messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 8192,
-      system: buildSystemPrompt(),
+      system: systemPrompt,
       tools: TOOLS,
       messages,
     }), 'continueAfterTool');

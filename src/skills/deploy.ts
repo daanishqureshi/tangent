@@ -28,6 +28,7 @@ import {
 } from '@aws-sdk/client-cloudwatch-logs';
 import { ecsClient, cwlClient } from '../services/aws.js';
 import { config } from '../config.js';
+import { getServiceUrl, setServiceUrlLater } from '../services/state.js';
 import { logger } from '../utils/logger.js';
 import { assertAllowedCluster } from '../utils/safety.js';
 import { SERVICE_PREFIX, TASK_FAMILY_PREFIX, NGROK_IMAGE } from '../utils/constants.js';
@@ -74,7 +75,7 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
   // ─── Resolve ngrok URL for this deploy ───────────────────────────────────
   // Reuse the URL from a previous deploy if one exists, so the endpoint stays
   // stable across redeployments. Pass freshUrl=true to generate a new one.
-  const ngrokUrl = resolveNgrokUrl(repo, input.freshUrl ?? false);
+  const ngrokUrl = await resolveNgrokUrl(repo, input.freshUrl ?? false);
 
   logger.info({ action: 'deploy:ngrok_url', ngrokUrl, fresh: input.freshUrl ?? false }, 'Resolved ngrok URL');
 
@@ -317,15 +318,20 @@ function saveNgrokUrl(repo: string, url: string): void {
   }
 }
 
-function resolveNgrokUrl(repo: string, fresh: boolean): string {
+async function resolveNgrokUrl(repo: string, fresh: boolean): Promise<string> {
+  const dbUrl = fresh ? null : await getServiceUrl(repo);
+  if (dbUrl) return dbUrl;
+
   const urls = loadNgrokUrls();
   if (!fresh && urls[repo]) {
+    setServiceUrlLater(repo, urls[repo]!, { migratedFrom: 'config/ngrok-urls.json' });
     return urls[repo]!;
   }
   const suffix = randomBytes(4).toString('hex');
   const slug = `tangent-${repo.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 20)}-${suffix}`;
   const url = `https://${slug}.ngrok.app`;
   saveNgrokUrl(repo, url);
+  setServiceUrlLater(repo, url, { fresh });
   return url;
 }
 

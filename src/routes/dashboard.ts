@@ -10,9 +10,11 @@ import { randomBytes } from 'node:crypto';
 import { DescribeServicesCommand, ListServicesCommand, type Service } from '@aws-sdk/client-ecs';
 import { config } from '../config.js';
 import { ecsClient } from '../services/aws.js';
-import { getRecentAuditEvents } from '../services/audit.js';
+import { getRecentAuditEventsFromDb } from '../services/audit.js';
 import { requireDashboardAuth } from '../services/auth.js';
+import { getMessagesSince } from '../services/conversations.js';
 import { injectSecretIntoService, listSecrets, putSecret } from '../services/environment.js';
+import { getRecentMemoryRuns, listActiveMemories } from '../services/memories.js';
 import { SERVICE_PREFIX } from '../utils/constants.js';
 
 const CSRF_TOKEN = randomBytes(24).toString('hex');
@@ -42,11 +44,24 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get<{ Querystring: DashboardQuery }>('/dashboard', async (req, reply) => {
-    const [services, secrets] = await Promise.all([
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const [services, secrets, auditEvents, conversations, memories, memoryRuns] = await Promise.all([
       listManagedServices(),
       listSecrets().catch(() => []),
+      getRecentAuditEventsFromDb(25).catch(() => []),
+      getMessagesSince(since, 25).catch(() => []),
+      listActiveMemories(25).catch(() => []),
+      getRecentMemoryRuns(10).catch(() => []),
     ]);
-    return reply.type('text/html').send(renderDashboard({ services, secrets, notice: req.query.notice }));
+    return reply.type('text/html').send(renderDashboard({
+      services,
+      secrets,
+      auditEvents,
+      conversations,
+      memories,
+      memoryRuns,
+      notice: req.query.notice,
+    }));
   });
 
   app.post<{ Body: SecretBody }>('/dashboard/secrets', async (req, reply) => {
@@ -109,9 +124,12 @@ async function listManagedServices(): Promise<Service[]> {
 function renderDashboard(opts: {
   services: Service[];
   secrets: Array<{ name: string; description?: string }>;
+  auditEvents: Array<{ ts: string; surface: string; actor: string; action: string; target?: string }>;
+  conversations: Array<{ id: number; role: string; slack_user_id: string | null; text: string; created_at: Date }>;
+  memories: Array<{ id: number; kind: string; subject_type: string; subject_id: string; content: string; importance: number }>;
+  memoryRuns: Array<Record<string, unknown>>;
   notice: string | undefined;
 }): string {
-  const auditEvents = getRecentAuditEvents(25);
   const serviceRows = opts.services.map((s) => {
     const name = s.serviceName ?? '';
     const repo = name.replace(SERVICE_PREFIX, '');
@@ -124,8 +142,17 @@ function renderDashboard(opts: {
   const secretRows = opts.secrets
     .map((s) => `<tr><td>${esc(s.name)}</td><td>${esc(s.description ?? '')}</td></tr>`)
     .join('');
-  const auditRows = auditEvents
+  const auditRows = opts.auditEvents
     .map((e) => `<tr><td>${esc(e.ts)}</td><td>${esc(e.surface)}</td><td>${esc(e.actor)}</td><td>${esc(e.action)}</td><td>${esc(e.target ?? '')}</td></tr>`)
+    .join('');
+  const conversationRows = opts.conversations
+    .map((m) => `<tr><td>${m.id}</td><td>${esc(m.created_at.toISOString())}</td><td>${esc(m.role)}</td><td>${esc(m.slack_user_id ?? '')}</td><td>${esc(m.text.slice(0, 240))}</td></tr>`)
+    .join('');
+  const memoryRows = opts.memories
+    .map((m) => `<tr><td>${m.id}</td><td>${esc(m.kind)}</td><td>${esc(`${m.subject_type}:${m.subject_id}`)}</td><td>${m.importance}</td><td>${esc(m.content)}</td></tr>`)
+    .join('');
+  const memoryRunRows = opts.memoryRuns
+    .map((r) => `<tr><td>${esc(String(r['id'] ?? ''))}</td><td>${esc(String(r['status'] ?? ''))}</td><td>${esc(String(r['started_at'] ?? ''))}</td><td>${esc(String(r['memories_created'] ?? 0))}</td><td>${esc(String(r['error'] ?? ''))}</td></tr>`)
     .join('');
 
   const notice = opts.notice ? `<div class="notice">${esc(opts.notice)}</div>` : '';
@@ -197,6 +224,21 @@ function renderDashboard(opts: {
   <section>
     <h2>Recent Audit Events</h2>
     <table><thead><tr><th>Time</th><th>Surface</th><th>Actor</th><th>Action</th><th>Target</th></tr></thead><tbody>${auditRows || '<tr><td colspan="5">No audit events yet</td></tr>'}</tbody></table>
+  </section>
+
+  <section>
+    <h2>Recent Conversations</h2>
+    <table><thead><tr><th>ID</th><th>Time</th><th>Role</th><th>User</th><th>Preview</th></tr></thead><tbody>${conversationRows || '<tr><td colspan="5">No conversation rows yet</td></tr>'}</tbody></table>
+  </section>
+
+  <section>
+    <h2>Memories</h2>
+    <table><thead><tr><th>ID</th><th>Kind</th><th>Subject</th><th>Importance</th><th>Content</th></tr></thead><tbody>${memoryRows || '<tr><td colspan="5">No active memories yet</td></tr>'}</tbody></table>
+  </section>
+
+  <section>
+    <h2>Memory Runs</h2>
+    <table><thead><tr><th>ID</th><th>Status</th><th>Started</th><th>Created</th><th>Error</th></tr></thead><tbody>${memoryRunRows || '<tr><td colspan="5">No memory runs yet</td></tr>'}</tbody></table>
   </section>
 </body>
 </html>`;

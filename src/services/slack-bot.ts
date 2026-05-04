@@ -31,7 +31,8 @@ import { discoverSkill } from '../skills/discover.js';
 import { listAllRepos, inspectRepo, pushFile, readRepoFile, listCommits, editFile } from './github.js';
 import { listSecrets, putSecret, injectSecretIntoService } from './environment.js';
 import { recordAuditEvent } from './audit.js';
-import { recordConversationMessageLater, type ConversationSource } from './conversations.js';
+import { recordConversationMessageLater, recordToolEvent, recordToolEventLater, type ConversationSource } from './conversations.js';
+import { addAllowedUserToDbLater, getServiceUrl, rememberPersonInDb } from './state.js';
 import { APPROVER_ID } from './policy.js';
 import { logger } from '../utils/logger.js';
 
@@ -433,6 +434,7 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
     }
     const newUserId = addUserMatch[1]!;
     const result = allowUser(newUserId);
+    addAllowedUserToDbLater(newUserId, undefined, 'slack_fast_path');
     let msg: string;
     if (result.alreadyAllowed && !result.persisted && !result.error) {
       msg = `ℹ️ <@${newUserId}> is already on the allowed list.`;
@@ -578,7 +580,7 @@ async function _routeInner(
 
     // Show the URL that will be used — reused or fresh — so user knows upfront
     const { getStoredNgrokUrl } = await import('../skills/deploy.js');
-    const existingUrl = getStoredNgrokUrl(repo);
+    const existingUrl = await getServiceUrl(repo) ?? getStoredNgrokUrl(repo);
     const urlNote = freshUrl
       ? `• URL: _new URL will be generated_`
       : existingUrl
@@ -705,24 +707,27 @@ async function executeToolCall(
   history: ConversationTurn[],
   chainDepth: number = 0,
 ): Promise<void> {
-  switch (call.name) {
-    case 'deploy':
-      _appendTurn(convKey, { role: 'assistant', content: `Deploying \`${(call.input as { repo: string }).repo}\`` });
-      await handleDeploy(ctx, call.input as { repo: string; branch: string; port: number; freshUrl?: boolean }, convKey);
-      break;
-    case 'teardown':
-      _appendTurn(convKey, { role: 'assistant', content: `Stopping \`${(call.input as { repo: string }).repo}\`` });
-      await handleTeardown(ctx, call.input as { repo: string }, convKey);
-      break;
-    case 'push_file':
-      await handlePushFile(ctx, call.input as { repo: string; path: string; content: string; message?: string; branch?: string }, convKey);
-      break;
-    case 'edit_file':
-      await handleEditFile(ctx, call.input as { repo: string; path: string; find: string; replace: string; replace_all?: boolean; message?: string; branch?: string }, convKey);
-      break;
-    case 'restore_file':
-      await handleRestoreFile(ctx, call.input as { repo: string; path: string; ref: string; message?: string }, convKey);
-      break;
+  await recordToolEvent({ convKey, toolName: call.name, phase: 'requested', input: call.input, metadata: { chainDepth } });
+  try {
+    await recordToolEvent({ convKey, toolName: call.name, phase: 'started', input: call.input, metadata: { chainDepth } });
+    switch (call.name) {
+      case 'deploy':
+        _appendTurn(convKey, { role: 'assistant', content: `Deploying \`${(call.input as { repo: string }).repo}\`` });
+        await handleDeploy(ctx, call.input as { repo: string; branch: string; port: number; freshUrl?: boolean }, convKey);
+        break;
+      case 'teardown':
+        _appendTurn(convKey, { role: 'assistant', content: `Stopping \`${(call.input as { repo: string }).repo}\`` });
+        await handleTeardown(ctx, call.input as { repo: string }, convKey);
+        break;
+      case 'push_file':
+        await handlePushFile(ctx, call.input as { repo: string; path: string; content: string; message?: string; branch?: string }, convKey);
+        break;
+      case 'edit_file':
+        await handleEditFile(ctx, call.input as { repo: string; path: string; find: string; replace: string; replace_all?: boolean; message?: string; branch?: string }, convKey);
+        break;
+      case 'restore_file':
+        await handleRestoreFile(ctx, call.input as { repo: string; path: string; ref: string; message?: string }, convKey);
+        break;
     case 'allow_user': {
       const { user_id, display_name } = call.input as { user_id: string; display_name: string };
       if (ctx.userId !== 'U07EU7KSG3U') {
@@ -732,6 +737,7 @@ async function executeToolCall(
         break;
       }
       const result = allowUser(user_id);
+      addAllowedUserToDbLater(user_id, display_name, 'slack_tool');
       let msg: string;
       if (result.alreadyAllowed && !result.persisted && !result.error) {
         msg = `ℹ️ <@${user_id}> (${display_name}) is already on the allowed list — no change needed.`;
@@ -799,6 +805,12 @@ async function executeToolCall(
       // Informational tools: fetch data, synthesize a conversational response via Claude
       await handleInfoTool(call, ctx, convKey, userMessage, history, chainDepth);
       break;
+    }
+    await recordToolEvent({ convKey, toolName: call.name, phase: 'completed', input: call.input, metadata: { chainDepth } });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await recordToolEvent({ convKey, toolName: call.name, phase: 'failed', input: call.input, error: msg, metadata: { chainDepth } });
+    throw err;
   }
 }
 
@@ -866,9 +878,12 @@ async function _chainIfNeeded(
     // fresh empty chain, losing the accumulated context.
     let nextResult: string;
     try {
+      recordToolEventLater({ convKey, toolName: next.call.name, phase: 'started', input: next.call.input, metadata: { chained: true, step } });
       nextResult = await dispatchChainedTool(next.call, ctx, convKey, userMessage, history);
+      recordToolEventLater({ convKey, toolName: next.call.name, phase: 'completed', input: next.call.input, result: nextResult, metadata: { chained: true, step } });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      recordToolEventLater({ convKey, toolName: next.call.name, phase: 'failed', input: next.call.input, error: msg, metadata: { chained: true, step } });
       logger.error({ action: 'chain:dispatch_failed', tool: next.call.name, err: msg }, 'Chained tool failed');
       await post(ctx.client, ctx.channel, ctx.threadTs, `❌ Chained \`${next.call.name}\` failed: ${msg}`);
       _appendTurn(convKey, { role: 'assistant', content: `Chained ${next.call.name} failed: ${msg}` });
@@ -2591,6 +2606,16 @@ async function handleRememberPerson(
 
     // Also update in-memory config so the current session has the new note
     config().peopleNotes = people;
+    try {
+      await rememberPersonInDb({
+        userId: input.user_id,
+        name: input.name,
+        note: input.note,
+        source: 'remember_person_tool',
+      });
+    } catch (err) {
+      logger.warn({ action: 'remember_person:db_failed', err }, 'Failed to persist person memory to DB');
+    }
 
     // Push to currently checked-out branch, not hardcoded `main` — EC2 was
     // historically on `master` and hardcoding a branch meant these commits
