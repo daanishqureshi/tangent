@@ -48,74 +48,95 @@ The unifying idea: **the LLM is the router.** There is no separate intent-classi
 
 ## Top-level architecture
 
-```
-                                ┌──────────────────────────────┐
-                                │            Slack             │
-                                │  (DMs, #tangent-deployments, │
-                                │          threads)            │
-                                └───────┬───────────────▲──────┘
-                                        │ Socket Mode   │ chat.postMessage / chat.update
-                                        │ (xapp-/xoxb-) │
-                            ┌───────────▼───────────────┴──────────┐
-                            │           TANGENT (EC2)              │
-                            │     Node 24 · TypeScript · PM2       │
-                            │                                      │
-                            │  ┌──────────────────────────────┐    │
-                            │  │  Slack Bolt app (slack-bot)  │    │
-                            │  └──────────┬───────────────────┘    │
-                            │             │ message + history      │
-                            │  ┌──────────▼───────────────────┐    │
-                            │  │  ai.ts — Claude Sonnet 4.6   │    │
-                            │  │  • processMessage()          │    │
-                            │  │  • continueAfterTool()       │    │
-                            │  │  • classifyConsent (haiku)   │    │
-                            │  │  • diagnoseServiceFailure    │    │
-                            │  │  • generateCodeFix           │    │
-                            │  └──────┬─────────────┬─────────┘    │
-                            │         │tool         │text          │
-                            │  ┌──────▼──────┐ ┌────▼─────────┐    │
-                            │  │  Skills     │ │  Slack reply │    │
-                            │  │  build      │ └──────────────┘    │
-                            │  │  deploy     │                     │
-                            │  │  tunnel     │                     │
-                            │  │  teardown   │                     │
-                            │  │  monitor    │                     │
-                            │  │  scan       │                     │
-                            │  │  discover   │                     │
-                            │  └──┬───┬──┬───┘                     │
-                            │     │   │  │                         │
-                            │  ┌──▼─┐┌▼┐┌▼─────┐  ┌─────────────┐  │
-                            │  │AWS ││Gh││Docker│  │  Fastify    │  │
-                            │  │SDK ││  ││ CLI  │  │  /deploy    │  │
-                            │  └─┬──┘└┬┘└──┬───┘  │  /teardown  │  │
-                            │    │    │    │      │  /status    │  │
-                            │    │    │    │      │  /list      │  │
-                            │    │    │    │      │  /health    │  │
-                            │    │    │    │      └─────────────┘  │
-                            │  ┌─▼────▼────▼────────────────┐      │
-                            │  │   cron: health-check 5m    │      │
-                            │  │   cron: CVE scan 02:00 UTC │      │
-                            │  └────────────────────────────┘      │
-                            └────┬─────────────┬───────────────────┘
-                                 │             │
-                ┌────────────────▼───┐    ┌────▼────────────────┐
-                │      AWS           │    │     GitHub          │
-                │  ECS  Fargate      │    │  Impiricus-AI org   │
-                │  ECR               │    │  Octokit (clone,    │
-                │  CloudWatch Logs   │    │  read, push, list)  │
-                │  Secrets Manager   │    └─────────────────────┘
-                └────────────────────┘
+```mermaid
+flowchart TD
+  Slack["Slack DMs, mentions, threads"] -->|"Socket Mode events"| SlackBot["Slack Bot\nsrc/services/slack-bot.ts"]
+  SlackBot -->|"chat.postMessage and chat.update"| Slack
+  Browser["VPN Browser"] -->|"Basic Auth"| Dashboard["Fastify Dashboard\n/dashboard"]
+  Scripts["Scripts and CI"] -->|"Basic Auth or bearer token"| HttpApi["Fastify HTTP API\n/deploy /teardown /status /list /health"]
 
-   Each deployed service =  ┌──────────── ECS Fargate Task ─────────────┐
-                            │  ┌─────────────┐    ┌──────────────────┐  │
-                            │  │ app         │    │ ngrok sidecar    │  │
-                            │  │ container   │◀───│ http localhost:N │  │
-                            │  │ from ECR    │    │ stable URL       │  │
-                            │  └─────────────┘    └────────┬─────────┘  │
-                            └─────────────────────────────│─────────────┘
-                                                          ▼
-                                              https://tangent-<repo>-XXXX.ngrok.app
-                                              (Google OAuth → @impiricus.com only)
+  subgraph tangentEc2 ["Tangent EC2: Node 24, TypeScript, PM2"]
+    SlackBot -->|"identity, allowlist, confirmations"| Policy["Action Policy\nsrc/services/policy.ts"]
+    Dashboard --> Auth["Auth Helpers\nsrc/services/auth.ts"]
+    HttpApi --> Auth
+    Auth --> Policy
+
+    SlackBot -->|"message and history"| AI["Claude Router\nsrc/services/ai.ts\nSonnet 4.6 tools, Haiku consent"]
+    MemoryContext["Memory Context\nsrc/services/memory-context.ts"] -->|"selected DB memories"| AI
+    AI -->|"text reply"| SlackBot
+    AI -->|"tool calls"| ToolExecutor["Tool Executor\nexecuteToolCall and chains"]
+    ToolExecutor --> Skills["Skill Layer\nbuild deploy tunnel teardown monitor scan discover"]
+    ToolExecutor --> Services["Integration Services\nGitHub AWS Docker Postgres Env Audit Conversations"]
+
+    Dashboard --> EnvService["Environment Service\nSecrets create update inject"]
+    Dashboard --> DashboardViews["Dashboard Views\nservices, secrets, conversations, memories, audit, memory runs"]
+    HttpApi --> Skills
+
+    CronHealth["Cron: health check\nEvery 5 minutes"] --> Skills
+    CronCve["Cron: CVE scan\n02:00 UTC"] --> Skills
+    CronMemory["Cron: memory summarize\n07:00 UTC"] --> MemoryService["Memory Service\nsrc/services/memories.ts"]
+
+    Services --> Migrations["DB Migrations\nsrc/services/db-migrations.ts"]
+    Migrations --> Postgres
+    EnvService --> AwsSecrets
+    MemoryService --> AI
+    MemoryService --> Postgres
+    MemoryContext --> Postgres
+    DashboardViews --> Postgres
+    Services --> Postgres
+  end
+
+  subgraph postgresBox ["Postgres on EC2: 10.40.40.123:5432"]
+    Postgres["Schema: tangent_app"]
+    Postgres --> ConversationMessages["conversation_messages\nSlack/user/assistant log"]
+    Postgres --> ToolEvents["tool_events\ntool requests and results"]
+    Postgres --> AuditEvents["audit_events\nmutations and ops"]
+    Postgres --> AllowedUsers["allowed_users\nSlack allowlist"]
+    Postgres --> ServiceUrls["service_urls\nstable ngrok URLs"]
+    Postgres --> Memories["memories\nperson facts, preferences, decisions, project context"]
+    Postgres --> MemorySources["memory_sources\nmemory to source-message links"]
+    Postgres --> MemoryRuns["memory_runs\ncron/manual summarization history"]
+    Postgres --> AppState["app_state\nlow-volume migration state"]
+  end
+
+  subgraph awsBox ["AWS Development Account"]
+    Ecs["ECS Fargate Cluster"]
+    Ecr["ECR Registry"]
+    CloudWatch["CloudWatch Logs"]
+    AwsSecrets["Secrets Manager\ntangent/*"]
+    Iam["IAM Roles\nexecution and task roles"]
+  end
+
+  subgraph githubBox ["GitHub"]
+    OrgRepos["Impiricus-AI repos\ninspect, read, edit, deploy"]
+    TangentRepo["Tangent repo\nself-edit and source"]
+  end
+
+  subgraph dockerBox ["EC2 Docker CLI"]
+    DockerBuild["docker build"]
+    DockerPush["docker push"]
+  end
+
+  Skills -->|"clone, inspect, read, push"| OrgRepos
+  Services -->|"Octokit"| OrgRepos
+  Services -->|"self tools"| TangentRepo
+  Skills -->|"build image"| DockerBuild
+  DockerBuild --> DockerPush
+  DockerPush --> Ecr
+  Skills -->|"register task, update service"| Ecs
+  Skills -->|"logs and health"| CloudWatch
+  Skills -->|"secret injection"| AwsSecrets
+  Ecs --> CloudWatch
+  Ecs --> Iam
+  Ecs --> DeployedTask["Each deployed service\napp container plus ngrok sidecar"]
+  DeployedTask -->|"image"| Ecr
+  DeployedTask -->|"runtime secrets"| AwsSecrets
+  DeployedTask -->|"DB_HOST and DB_PORT"| Postgres
+  DeployedTask --> Ngrok["ngrok stable URL\nGoogle OAuth domains"]
+  Ngrok --> PublicUsers["Approved Google domains\nimpiricus.com and docupdate.io"]
+
+  ConfigFiles["Fallback repo files\nconfig/people.json\nconfig/allowed_users.json\nconfig/ngrok-urls.json"] -. "bootstrap and fallback" .-> Services
+  AuditJsonl["Fallback log file\nlogs/audit.jsonl"] -. "fallback audit trail" .-> Services
 ```
 
 ---
