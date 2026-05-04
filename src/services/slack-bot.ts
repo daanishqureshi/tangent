@@ -31,6 +31,7 @@ import { discoverSkill } from '../skills/discover.js';
 import { listAllRepos, inspectRepo, pushFile, readRepoFile, listCommits, editFile } from './github.js';
 import { listSecrets, putSecret, injectSecretIntoService } from './environment.js';
 import { recordAuditEvent } from './audit.js';
+import { recordConversationMessageLater, type ConversationSource } from './conversations.js';
 import { APPROVER_ID } from './policy.js';
 import { logger } from '../utils/logger.js';
 
@@ -169,6 +170,10 @@ function _isActiveThread(channel: string, threadTs: string): boolean {
 
 function _convKey(channel: string, threadTs: string, source: 'mention' | 'dm'): string {
   return source === 'dm' ? channel : `${channel}:${threadTs}`;
+}
+
+function _conversationSource(source: 'mention' | 'dm'): ConversationSource {
+  return source === 'dm' ? 'slack_dm' : 'slack_thread';
 }
 
 function _getHistory(key: string): ConversationTurn[] {
@@ -394,6 +399,19 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
   // Propagate to ctx so all downstream functions use the resolved identity
   ctx.userId = resolvedUserId;
 
+  const convKey = _convKey(ctx.channel, ctx.threadTs, source);
+  recordConversationMessageLater({
+    convKey,
+    source: _conversationSource(source),
+    channel: ctx.channel,
+    threadTs: ctx.threadTs,
+    messageTs,
+    userId: resolvedUserId,
+    role: 'user',
+    text,
+    metadata: { slackSource: source },
+  });
+
   // Access control
   const { allowedSlackUserIds } = config();
   if (allowedSlackUserIds.size > 0 && (!resolvedUserId || !allowedSlackUserIds.has(resolvedUserId))) {
@@ -429,8 +447,6 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
     await post(ctx.client, ctx.channel, ctx.threadTs, msg);
     return;
   }
-
-  const convKey = _convKey(ctx.channel, ctx.threadTs, source);
 
   // ── Concurrency guard ─────────────────────────────────────────────────────
   // If we're already processing a message for this conversation (e.g. chaining
@@ -1443,7 +1459,18 @@ async function post(
   blocks?: KnownBlock[],
 ): Promise<string> {
   const result = await client.chat.postMessage({ channel, thread_ts: threadTs, text, blocks });
-  return result.ts as string;
+  const ts = result.ts as string;
+  recordConversationMessageLater({
+    convKey: channel.startsWith('D') ? channel : `${channel}:${threadTs}`,
+    source: channel.startsWith('D') ? 'slack_dm' : 'slack_thread',
+    channel,
+    threadTs,
+    messageTs: ts,
+    role: 'assistant',
+    text,
+    metadata: blocks ? { hasBlocks: true } : undefined,
+  });
+  return ts;
 }
 
 async function update(
@@ -1454,6 +1481,16 @@ async function update(
   blocks?: KnownBlock[],
 ): Promise<void> {
   await client.chat.update({ channel, ts, text, blocks });
+  recordConversationMessageLater({
+    convKey: channel.startsWith('D') ? channel : `${channel}:${ts}`,
+    source: channel.startsWith('D') ? 'slack_dm' : 'slack_thread',
+    channel,
+    threadTs: ts,
+    messageTs: ts,
+    role: 'assistant',
+    text,
+    metadata: blocks ? { hasBlocks: true, slackUpdate: true } : { slackUpdate: true },
+  });
 }
 
 // ─── One-shot post-deploy health check ───────────────────────────────────────
