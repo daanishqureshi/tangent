@@ -101,10 +101,32 @@ export async function putSecret(
   return { name, created };
 }
 
+export interface InjectedSecret {
+  name: string;
+  valueFrom: string;
+}
+
+export async function getInjectedSecrets(repo: string): Promise<InjectedSecret[]> {
+  const taskFamily = `${TASK_FAMILY_PREFIX}${repo}`;
+  const listResult = await ecsClient().send(new ListTaskDefinitionsCommand({
+    familyPrefix: taskFamily,
+    sort: 'DESC',
+    maxResults: 1,
+    status: 'ACTIVE',
+  }));
+  const latestArn = listResult.taskDefinitionArns?.[0];
+  if (!latestArn) return [];
+
+  const descResult = await ecsClient().send(new DescribeTaskDefinitionCommand({ taskDefinition: latestArn }));
+  const appContainer = descResult.taskDefinition?.containerDefinitions?.find((c) => c.name === 'app');
+  return (appContainer?.secrets ?? [])
+    .filter((s): s is InjectedSecret => Boolean(s.name && s.valueFrom));
+}
+
 export async function injectSecretIntoService(
   input: { repo: string; secretName: string; envVarName?: string },
   actor: ActorContext,
-): Promise<{ secretName: string; envVarName: string; taskDefinitionArn: string }> {
+): Promise<{ secretName: string; envVarName: string; taskDefinitionArn: string; alreadyInjected: boolean }> {
   const { ecsClusterName, ecsTaskRoleArn, secretsManagerPrefix } = config();
   assertAllowedCluster(ecsClusterName);
 
@@ -137,6 +159,18 @@ export async function injectSecretIntoService(
   if (!appContainer) throw new Error('No "app" container found in task definition');
 
   const existingSecrets = appContainer.secrets ?? [];
+  const existing = existingSecrets.find((s) => s.name === envVarName);
+  if (existing?.valueFrom === secretArn) {
+    await recordAuditEvent({
+      action: 'secret:inject:skip_existing',
+      actor: actor.actor,
+      surface: actor.surface,
+      target: input.repo,
+      metadata: { secretName, envVarName, taskDefinitionArn: latestArn },
+    });
+    return { secretName, envVarName, taskDefinitionArn: latestArn, alreadyInjected: true };
+  }
+
   appContainer.secrets = [
     ...existingSecrets
       .filter((s) => s.name !== envVarName)
@@ -168,12 +202,20 @@ export async function injectSecretIntoService(
   const taskDefinitionArn = registerResult.taskDefinition?.taskDefinitionArn;
   if (!taskDefinitionArn) throw new Error('Task definition re-registration returned no ARN');
 
-  await ecsClient().send(new UpdateServiceCommand({
-    cluster: ecsClusterName,
-    service: `${SERVICE_PREFIX}${input.repo}`,
-    taskDefinition: taskDefinitionArn,
-    forceNewDeployment: true,
-  }));
+  try {
+    await ecsClient().send(new UpdateServiceCommand({
+      cluster: ecsClusterName,
+      service: `${SERVICE_PREFIX}${input.repo}`,
+      taskDefinition: taskDefinitionArn,
+      forceNewDeployment: true,
+    }));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/active deployments|unable to create new deployment/i.test(msg)) {
+      throw new Error(`ECS already has too many active deployments for "${input.repo}". Wait ~30-60 seconds for the current rollout to settle, then retry this same injection.`);
+    }
+    throw err;
+  }
 
   await recordAuditEvent({
     action: 'secret:inject',
@@ -183,5 +225,5 @@ export async function injectSecretIntoService(
     metadata: { secretName, envVarName, taskDefinitionArn },
   });
 
-  return { secretName, envVarName, taskDefinitionArn };
+  return { secretName, envVarName, taskDefinitionArn, alreadyInjected: false };
 }

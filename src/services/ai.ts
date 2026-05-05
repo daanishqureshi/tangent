@@ -22,7 +22,7 @@ export interface ConversationTurn {
 }
 
 export type AgentToolCall =
-  | { name: 'deploy';          input: { repo: string; branch: string; port: number; freshUrl?: boolean } }
+  | { name: 'deploy';          input: { repo: string; branch: string; port: number; freshUrl?: boolean; skipAnalysis?: boolean; analysisOverrideReason?: string } }
   | { name: 'teardown';        input: { repo: string } }
   | { name: 'status';          input: { repo: string } }
   | { name: 'list_services';   input: Record<string, never> }
@@ -1483,6 +1483,7 @@ export async function generateCodeFix(
 export interface DeployBlocker {
   issue: string;
   fix: string;
+  evidence?: Array<{ file: string; matchedText: string; reason: string }>;
 }
 
 export interface DeployWarning {
@@ -1517,6 +1518,7 @@ export async function analyzeDeployEligibility(
     dockerCompose: string | null;
     claudeMd: string | null;
     entryPoint: string | null;
+    sourceEvidence?: Array<{ file: string; matchedText: string; reason: string; severity?: string }>;
   },
 ): Promise<DeployAnalysis> {
   logger.info({ action: 'ai:analyze_deploy', repo }, 'Analyzing repo deploy eligibility');
@@ -1525,6 +1527,8 @@ export async function analyzeDeployEligibility(
   const dataSection = [
     `REPO: ${repo}`,
     `TOP-LEVEL FILES: ${repoData.files.join(', ')}`,
+    `\nSTATIC_EVIDENCE (source-backed matches only; hard blockers must cite these):\n${JSON.stringify(repoData.sourceEvidence ?? [], null, 2)}`,
+    `\nDOC_HINTS (may be stale; never hard-block from these alone):`,
     repoData.dockerfile      ? `\nDOCKERFILE:\n${repoData.dockerfile}`               : '\nDOCKERFILE: (not found)',
     repoData.packageJson     ? `\nPACKAGE.JSON:\n${repoData.packageJson}`             : '',
     repoData.requirementsTxt ? `\nREQUIREMENTS.TXT:\n${repoData.requirementsTxt}`     : '',
@@ -1547,12 +1551,18 @@ TANGENT'S DEPLOYMENT MODEL (know this cold):
 - ngrok tunnel handles all inbound HTTP traffic
 - The app MUST bind to 0.0.0.0 (not 127.0.0.1 / localhost)
 
-BLOCKERS — set eligible=false if ANY of these are present:
+BLOCKERS — set eligible=false ONLY if source-backed evidence proves ANY of these are present:
 1. No Dockerfile in the repo
 2. Dockerfile has no CMD and no ENTRYPOINT
 3. App server binds only to 127.0.0.1 or localhost (not 0.0.0.0)
 4. File-path credentials: GOOGLE_APPLICATION_CREDENTIALS or similar set to a JSON file path
 5. Hard-coded localhost service URLs (DB, Redis, etc.) that aren't read from env vars
+
+Evidence rules:
+- For blocker types 3, 4, and 5, you MUST cite STATIC_EVIDENCE. Do not infer from README, CLAUDE.md, comments, or migration notes.
+- If DOC_HINTS claim a problem but STATIC_EVIDENCE does not show it, set eligible=true and put it in warnings as "documentation may be stale".
+- If source and docs conflict, source wins.
+- Do not block on a hypothetical pattern or "likely" file. Only block on concrete source, Dockerfile, or package-script evidence.
 
 WARNINGS — eligible=true but surface these:
 1. DATABASE_URL composite string (works if injected as a secret but DB_HOST/DB_PORT/DB_PASSWORD is preferred)
@@ -1564,7 +1574,7 @@ OUTPUT: Return ONLY valid JSON, no markdown fences, matching exactly this schema
 {
   "eligible": boolean,
   "detectedPort": number | null,
-  "blockers": [{ "issue": "concise description", "fix": "specific fix with file names + what to change" }],
+  "blockers": [{ "issue": "concise description", "fix": "specific fix with file names + what to change", "evidence": [{ "file": "path", "matchedText": "exact match", "reason": "why this proves the blocker" }] }],
   "warnings": [{ "issue": "concise description", "suggestion": "what to do about it" }],
   "claudeCodePrompt": string | null
 }
@@ -1593,13 +1603,44 @@ claudeCodePrompt rules (when eligible=false):
     const json = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
     const parsed = JSON.parse(json) as DeployAnalysis;
 
+    const sourceEvidence = repoData.sourceEvidence ?? [];
+    const blockers = Array.isArray(parsed.blockers) ? parsed.blockers : [];
+    const evidenceBackedBlockers = blockers.filter((blocker) => {
+      const blockerEvidence = Array.isArray(blocker.evidence) ? blocker.evidence : [];
+      if (blockerEvidence.length === 0) return false;
+      return blockerEvidence.some((e) =>
+        sourceEvidence.some((src) => src.file === e.file && (e.matchedText ? src.matchedText.includes(e.matchedText) || e.matchedText.includes(src.matchedText) : true)),
+      );
+    });
+    const scannerBlockers: DeployBlocker[] = sourceEvidence
+      .filter((e) => e.severity === 'blocker')
+      .filter((e) => !evidenceBackedBlockers.some((b) =>
+        Array.isArray(b.evidence) && b.evidence.some((be) =>
+          be.file === e.file && (be.matchedText.includes(e.matchedText) || e.matchedText.includes(be.matchedText)),
+        ),
+      ))
+      .map((e) => ({
+        issue: e.reason,
+        fix: `Update ${e.file} so it works in ECS Fargate without localhost-only bindings, file-path credentials, or hardcoded local services.`,
+        evidence: [{ file: e.file, matchedText: e.matchedText, reason: e.reason }],
+      }));
+    const finalBlockers = [...evidenceBackedBlockers, ...scannerBlockers];
+    const downgradedWarnings: DeployWarning[] = blockers.length === evidenceBackedBlockers.length
+      ? []
+      : blockers
+        .filter((b) => !evidenceBackedBlockers.includes(b))
+        .map((b) => ({
+          issue: `Doc-only or unsupported blocker downgraded: ${b.issue}`,
+          suggestion: b.fix,
+        }));
+
     // Normalise fields so callers can always trust the shape
     return {
-      eligible:         Boolean(parsed.eligible),
+      eligible:         finalBlockers.length === 0 ? true : Boolean(parsed.eligible),
       detectedPort:     parsed.detectedPort != null ? Number(parsed.detectedPort) : null,
-      blockers:         Array.isArray(parsed.blockers)  ? parsed.blockers  : [],
-      warnings:         Array.isArray(parsed.warnings)  ? parsed.warnings  : [],
-      claudeCodePrompt: parsed.claudeCodePrompt ?? null,
+      blockers:         finalBlockers,
+      warnings:         [...(Array.isArray(parsed.warnings) ? parsed.warnings : []), ...downgradedWarnings],
+      claudeCodePrompt: finalBlockers.length > 0 ? (parsed.claudeCodePrompt ?? buildDeployFixPrompt(repo, finalBlockers, cfg.pgHostInternalIp)) : null,
     };
   } catch (err) {
     logger.error({ action: 'ai:analyze_deploy:failed', err }, 'Deploy analysis failed — allowing deploy to proceed');
@@ -1612,6 +1653,23 @@ claudeCodePrompt rules (when eligible=false):
       claudeCodePrompt: null,
     };
   }
+}
+
+function buildDeployFixPrompt(repo: string, blockers: DeployBlocker[], pgHostInternalIp: string): string {
+  const blockerText = blockers
+    .map((b, i) => `${i + 1}. ${b.issue}\nFix: ${b.fix}`)
+    .join('\n\n');
+  return [
+    'Fix this repo for AWS ECS Fargate deployment via Tangent.',
+    '',
+    `Repo: ${repo}`,
+    '',
+    'Blockers:',
+    blockerText,
+    '',
+    `Tangent automatically provides DB_HOST=${pgHostInternalIp}, DB_PORT=5432, DB_PASSWORD through Secrets Manager injection, and ANTHROPIC_API_KEY.`,
+    'Once fixed, ask Tangent in Slack to deploy again.',
+  ].join('\n');
 }
 
 // ─── Error summarizers (used by build.ts and deploy flow) ────────────────────

@@ -112,6 +112,25 @@ export async function listAllRepos(): Promise<RepoInfo[]> {
   return repos;
 }
 
+export async function listRepoFiles(repo: string, branch = 'main', owner?: string): Promise<string[]> {
+  const resolvedOwner = owner ?? config().githubOrg;
+  const branchInfo = await octokit().repos.getBranch({
+    owner: resolvedOwner,
+    repo,
+    branch,
+  });
+  const tree = await octokit().git.getTree({
+    owner: resolvedOwner,
+    repo,
+    tree_sha: branchInfo.data.commit.sha,
+    recursive: 'true',
+  });
+  return tree.data.tree
+    .filter((entry) => entry.type === 'blob' && typeof entry.path === 'string')
+    .map((entry) => entry.path!)
+    .sort();
+}
+
 export interface RepoInspection {
   name: string;
   description: string | null;

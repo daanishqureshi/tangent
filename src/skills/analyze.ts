@@ -9,11 +9,18 @@
  * so the developer can fix the repo without needing SSH or DevOps knowledge.
  */
 
-import { inspectRepo, readRepoFile } from '../services/github.js';
+import { inspectRepo, listRepoFiles, readRepoFile } from '../services/github.js';
 import { analyzeDeployEligibility, type DeployAnalysis } from '../services/ai.js';
 import { logger } from '../utils/logger.js';
 
 export type { DeployAnalysis };
+
+export interface StaticEvidence {
+  file: string;
+  matchedText: string;
+  reason: string;
+  severity: 'blocker' | 'warning';
+}
 
 /**
  * Full pre-deploy eligibility check for a repo.
@@ -49,6 +56,10 @@ export async function runDeployAnalysis(
   const envExample      = envExampleResult.status      === 'fulfilled' ? envExampleResult.value      : null;
   const dockerCompose   = dockerComposeResult.status   === 'fulfilled' ? dockerComposeResult.value   : null;
   const claudeMd        = claudeMdResult.status        === 'fulfilled' ? claudeMdResult.value        : null;
+  const sourceEvidence  = [
+    ...buildDockerfileEvidence(inspection.dockerfile),
+    ...await scanStaticDeployEvidence(repo, branch, inspection.packageJson !== null),
+  ];
 
   // ── 3. Try to read the main entry-point file ─────────────────────────────────
   // For Node: parse package.json for "main" or derive from "scripts.start".
@@ -89,6 +100,7 @@ export async function runDeployAnalysis(
     dockerCompose,
     claudeMd,
     entryPoint,
+    sourceEvidence,
   });
 
   logger.info(
@@ -104,4 +116,96 @@ export async function runDeployAnalysis(
   );
 
   return result;
+}
+
+async function scanStaticDeployEvidence(repo: string, branch: string, isNodeRepo: boolean): Promise<StaticEvidence[]> {
+  const evidence: StaticEvidence[] = [];
+  let files: string[] = [];
+  try {
+    files = await listRepoFiles(repo, branch);
+  } catch (err) {
+    logger.warn({ action: 'analyze:tree_failed', repo, err }, 'Could not list repo tree for static evidence scan');
+    return evidence;
+  }
+
+  const sourceFiles = files
+    .filter((path) => isCandidateSourceFile(path, isNodeRepo))
+    .slice(0, 60);
+
+  const contents = await Promise.all(sourceFiles.map(async (file) => ({
+    file,
+    content: await readRepoFile(repo, file, branch).catch(() => null),
+  })));
+
+  for (const { file, content } of contents) {
+    if (!content) continue;
+    const truncated = content.slice(0, 40_000);
+    collectEvidence(evidence, file, truncated);
+  }
+
+  return evidence;
+}
+
+function isCandidateSourceFile(path: string, isNodeRepo: boolean): boolean {
+  if (path.includes('node_modules/') || path.includes('dist/') || path.includes('build/')) return false;
+  if (/\.(js|mjs|cjs|ts|tsx|py)$/.test(path)) return true;
+  if (['Dockerfile', 'package.json', 'requirements.txt'].includes(path)) return true;
+  if (isNodeRepo && path.startsWith('src/')) return true;
+  return false;
+}
+
+function collectEvidence(out: StaticEvidence[], file: string, content: string): void {
+  const checks: Array<{ re: RegExp; reason: string; severity: StaticEvidence['severity'] }> = [
+    {
+      re: /process\.env\.GOOGLE_APPLICATION_CREDENTIALS\s*=\s*[^;\n]+/g,
+      reason: 'Source sets GOOGLE_APPLICATION_CREDENTIALS to a file path instead of passing credentials in-process.',
+      severity: 'blocker',
+    },
+    {
+      re: /fs\.(?:writeFileSync|promises\.writeFile|writeFile)\s*\([^)]*\/tmp[^)]*(?:GOOGLE_SERVICE_ACCOUNT_JSON|service_account|credentials|json)[^)]*\)/gims,
+      reason: 'Source writes service-account credentials to /tmp.',
+      severity: 'blocker',
+    },
+    {
+      re: /\.listen\s*\([^)]*(?:['"`](?:127\.0\.0\.1|localhost)['"`]|host\s*:\s*['"`](?:127\.0\.0\.1|localhost)['"`])/gim,
+      reason: 'Source appears to bind the HTTP server to localhost instead of 0.0.0.0.',
+      severity: 'blocker',
+    },
+    {
+      re: /(?:postgres(?:ql)?:\/\/[^'"\s]*@(?:localhost|127\.0\.0\.1)|redis:\/\/(?:localhost|127\.0\.0\.1)|mongodb[^'"\s]*(?:localhost|127\.0\.0\.1)|DB_HOST\s*[:=]\s*['"`](?:localhost|127\.0\.0\.1)['"`])/gim,
+      reason: 'Source appears to hardcode a localhost service URL instead of reading runtime env vars.',
+      severity: 'blocker',
+    },
+  ];
+
+  for (const check of checks) {
+    for (const match of content.matchAll(check.re)) {
+      out.push({
+        file,
+        matchedText: (match[0] ?? '').slice(0, 240),
+        reason: check.reason,
+        severity: check.severity,
+      });
+    }
+  }
+}
+
+function buildDockerfileEvidence(dockerfile: string | null): StaticEvidence[] {
+  if (!dockerfile) {
+    return [{
+      file: 'Dockerfile',
+      matchedText: '(not found)',
+      reason: 'Repo has no Dockerfile, so Tangent cannot build an ECS container image.',
+      severity: 'blocker',
+    }];
+  }
+  if (!/\b(?:CMD|ENTRYPOINT)\b/i.test(dockerfile)) {
+    return [{
+      file: 'Dockerfile',
+      matchedText: dockerfile.slice(0, 240),
+      reason: 'Dockerfile has no CMD or ENTRYPOINT, so the ECS task has no app process to run.',
+      severity: 'blocker',
+    }];
+  }
+  return [];
 }

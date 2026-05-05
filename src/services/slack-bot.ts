@@ -98,6 +98,15 @@ interface PendingConfirmation {
 
 const _pendingConfirmations = new Map<string, PendingConfirmation>();
 
+interface PendingDeployOverride {
+  call: AgentToolCall;
+  blockers: string[];
+  expiresAt: number;
+  requestedBy?: string;
+}
+
+const _pendingDeployOverrides = new Map<string, PendingDeployOverride>();
+
 function _setPending(convKey: string, call: AgentToolCall, prompt: string, requiredApproverId?: string, requestedBy?: string): void {
   _pendingConfirmations.set(convKey, { call, prompt, expiresAt: Date.now() + CONFIRM_TTL_MS, requiredApproverId, requestedBy });
 }
@@ -111,6 +120,25 @@ function _getPending(convKey: string): PendingConfirmation | null {
 
 function _clearPending(convKey: string): void {
   _pendingConfirmations.delete(convKey);
+}
+
+function _setPendingDeployOverride(convKey: string, call: AgentToolCall, blockers: string[], requestedBy?: string): void {
+  _pendingDeployOverrides.set(convKey, { call, blockers, requestedBy, expiresAt: Date.now() + CONFIRM_TTL_MS });
+}
+
+function _getPendingDeployOverride(convKey: string): PendingDeployOverride | null {
+  const p = _pendingDeployOverrides.get(convKey);
+  if (!p) return null;
+  if (Date.now() > p.expiresAt) { _pendingDeployOverrides.delete(convKey); return null; }
+  return p;
+}
+
+function _clearPendingDeployOverride(convKey: string): void {
+  _pendingDeployOverrides.delete(convKey);
+}
+
+function isDeployOverrideIntent(text: string): boolean {
+  return /\b(override|continue anyway|deploy anyway|false positive|bypass|proceed anyway|ignore blocker|ignore the blocker)\b/i.test(text);
 }
 
 // ─── Per-conversation processing lock ───────────────────────────────────────
@@ -477,6 +505,40 @@ async function _routeInner(
   resolvedUserId: string | undefined,
   convKey: string,
 ): Promise<void> {
+  const override = _getPendingDeployOverride(convKey);
+  if (override && isDeployOverrideIntent(text)) {
+    if (resolvedUserId !== APPROVER_ID) {
+      const msg = `🔒 Only <@${APPROVER_ID}> can override deploy analysis blockers.`;
+      await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+      _appendTurn(convKey, { role: 'assistant', content: msg });
+      return;
+    }
+    _clearPendingDeployOverride(convKey);
+    const repo = (override.call.input as { repo: string }).repo;
+    const call = {
+      ...override.call,
+      input: {
+        ...override.call.input,
+        skipAnalysis: true,
+        analysisOverrideReason: `Daanish marked deploy analysis as a false positive: ${text}`,
+      },
+    } as AgentToolCall;
+    const prompt = [
+      `⚠️ *Override deploy analysis for \`${repo}\`?*`,
+      '',
+      'This will skip the pre-deploy blocker check for this deploy only.',
+      '',
+      '*Previously reported blockers:*',
+      ...override.blockers.map((b, i) => `${i + 1}. ${b}`),
+      '',
+      `<@${APPROVER_ID}> — reply *yes* to deploy anyway or *no* to cancel.`,
+    ].join('\n');
+    _setPending(convKey, call, prompt, APPROVER_ID, resolvedUserId);
+    await post(ctx.client, ctx.channel, ctx.threadTs, prompt);
+    _appendTurn(convKey, { role: 'assistant', content: prompt });
+    return;
+  }
+
   // ── Check for pending confirmation first ───────────────────────────────────
   // If a deploy/teardown is waiting for approval, handle yes/no before
   // doing anything else.
@@ -537,80 +599,7 @@ async function _routeInner(
 
   // Deploy and teardown require explicit confirmation before executing
   if (call.name === 'deploy') {
-    let { repo, branch, port, freshUrl } = call.input as { repo: string; branch: string; port: number; freshUrl?: boolean };
-
-    // ── Validate repo exists in GitHub before showing confirmation ─────────
-    let allRepos: { name: string }[];
-    try {
-      allRepos = await listAllRepos();
-    } catch {
-      allRepos = [];
-    }
-    const repoExists = allRepos.some((r) => r.name.toLowerCase() === repo.toLowerCase());
-
-    if (!repoExists) {
-      const available = allRepos.length > 0
-        ? `Available repos: ${allRepos.map((r) => `\`${r.name}\``).join(', ')}`
-        : 'Could not fetch repo list — check GitHub token.';
-      const errMsg = `❌ Repo \`${repo}\` not found in the Impiricus-AI org.\n${available}`;
-      await post(ctx.client, ctx.channel, ctx.threadTs, errMsg);
-      _appendTurn(convKey, { role: 'assistant', content: errMsg });
-      return;
-    }
-
-    // ── Auto-detect port from Dockerfile EXPOSE if Claude defaulted to 8080 ─
-    // The LLM frequently forgets to pass the right port even when inspect_repo
-    // showed it. This catches the mismatch before it causes a broken deploy.
-    if (port === 8080) {
-      try {
-        const info = await inspectRepo(repo);
-        if (info.exposedPort && info.exposedPort !== 8080) {
-          logger.info(
-            { action: 'deploy:port_override', repo, requested: port, dockerfile: info.exposedPort },
-            `Overriding default port 8080 → ${info.exposedPort} (from Dockerfile EXPOSE)`,
-          );
-          port = info.exposedPort;
-          // Update the call input so the downstream deploy skill uses the right port
-          (call.input as Record<string, unknown>)['port'] = port;
-        }
-      } catch {
-        // If inspect fails, proceed with the requested port — it'll fail at deploy anyway
-      }
-    }
-
-    // Show the URL that will be used — reused or fresh — so user knows upfront
-    const { getStoredNgrokUrl } = await import('../skills/deploy.js');
-    const existingUrl = await getServiceUrl(repo) ?? getStoredNgrokUrl(repo);
-    const urlNote = freshUrl
-      ? `• URL: _new URL will be generated_`
-      : existingUrl
-        ? `• URL: ${existingUrl} _(same as last deploy)_`
-        : `• URL: _new URL will be generated_`;
-
-    const requester = ctx.userId ? `<@${ctx.userId}>` : 'Someone';
-    const prompt = [
-      `🚀 *Deploy requested for \`${repo}\`*`,
-      `• Requested by: ${requester}`,
-      `• Branch: \`${branch}\``,
-      `• Port: ${port}`,
-      urlNote,
-      `• Cluster: \`tangent\` (us-east-1)`,
-      '',
-      `${requester} — reply *yes* to approve or *no* to cancel.`,
-    ].join('\n');
-
-    // Post confirmation in the current thread.
-    // No requiredApproverId — any authorised user (including the requester)
-    // can approve a deploy. Teardowns remain Daanish-only.
-    _setPending(convKey, call, prompt, undefined, ctx.userId);
-    await post(ctx.client, ctx.channel, ctx.threadTs, prompt);
-    _appendTurn(convKey, { role: 'assistant', content: prompt });
-
-    // Also notify #tangent-deployments if the request didn't come from there
-    if (ctx.channel !== DEPLOY_CHANNEL) {
-      const notif = `📣 Deploy request for \`${repo}\` (from ${requester}) — awaiting approval.`;
-      await post(ctx.client, DEPLOY_CHANNEL, DEPLOY_CHANNEL, notif);
-    }
+    await promptForDeployCall(call, ctx, convKey);
     return;
   }
 
@@ -690,6 +679,75 @@ async function _routeInner(
   }
 }
 
+async function promptForDeployCall(call: AgentToolCall, ctx: Ctx, convKey: string): Promise<void> {
+  let { repo, branch, port, freshUrl } = call.input as { repo: string; branch: string; port: number; freshUrl?: boolean };
+
+  // ── Validate repo exists in GitHub before showing confirmation ─────────
+  let allRepos: { name: string }[];
+  try {
+    allRepos = await listAllRepos();
+  } catch {
+    allRepos = [];
+  }
+  const repoExists = allRepos.some((r) => r.name.toLowerCase() === repo.toLowerCase());
+
+  if (!repoExists) {
+    const available = allRepos.length > 0
+      ? `Available repos: ${allRepos.map((r) => `\`${r.name}\``).join(', ')}`
+      : 'Could not fetch repo list — check GitHub token.';
+    const errMsg = `❌ Repo \`${repo}\` not found in the Impiricus-AI org.\n${available}`;
+    await post(ctx.client, ctx.channel, ctx.threadTs, errMsg);
+    _appendTurn(convKey, { role: 'assistant', content: errMsg });
+    return;
+  }
+
+  // ── Auto-detect port from Dockerfile EXPOSE if Claude defaulted to 8080 ─
+  if (port === 8080) {
+    try {
+      const info = await inspectRepo(repo);
+      if (info.exposedPort && info.exposedPort !== 8080) {
+        logger.info(
+          { action: 'deploy:port_override', repo, requested: port, dockerfile: info.exposedPort },
+          `Overriding default port 8080 → ${info.exposedPort} (from Dockerfile EXPOSE)`,
+        );
+        port = info.exposedPort;
+        (call.input as Record<string, unknown>)['port'] = port;
+      }
+    } catch {
+      // If inspect fails, proceed with the requested port — it'll fail at deploy anyway
+    }
+  }
+
+  const { getStoredNgrokUrl } = await import('../skills/deploy.js');
+  const existingUrl = await getServiceUrl(repo) ?? getStoredNgrokUrl(repo);
+  const urlNote = freshUrl
+    ? `• URL: _new URL will be generated_`
+    : existingUrl
+      ? `• URL: ${existingUrl} _(same as last deploy)_`
+      : `• URL: _new URL will be generated_`;
+
+  const requester = ctx.userId ? `<@${ctx.userId}>` : 'Someone';
+  const prompt = [
+    `🚀 *Deploy requested for \`${repo}\`*`,
+    `• Requested by: ${requester}`,
+    `• Branch: \`${branch}\``,
+    `• Port: ${port}`,
+    urlNote,
+    `• Cluster: \`tangent\` (us-east-1)`,
+    '',
+    `${requester} — reply *yes* to approve or *no* to cancel.`,
+  ].join('\n');
+
+  _setPending(convKey, call, prompt, undefined, ctx.userId);
+  await post(ctx.client, ctx.channel, ctx.threadTs, prompt);
+  _appendTurn(convKey, { role: 'assistant', content: prompt });
+
+  if (ctx.channel !== DEPLOY_CHANNEL) {
+    const notif = `📣 Deploy request for \`${repo}\` (from ${requester}) — awaiting approval.`;
+    await post(ctx.client, DEPLOY_CHANNEL, DEPLOY_CHANNEL, notif);
+  }
+}
+
 // ─── Tool executor ────────────────────────────────────────────────────────────
 //
 // For action tools (deploy, teardown): keep rich progress blocks — they have
@@ -713,7 +771,7 @@ async function executeToolCall(
     switch (call.name) {
       case 'deploy':
         _appendTurn(convKey, { role: 'assistant', content: `Deploying \`${(call.input as { repo: string }).repo}\`` });
-        await handleDeploy(ctx, call.input as { repo: string; branch: string; port: number; freshUrl?: boolean }, convKey);
+        await handleDeploy(ctx, call.input as { repo: string; branch: string; port: number; freshUrl?: boolean; skipAnalysis?: boolean; analysisOverrideReason?: string }, convKey);
         break;
       case 'teardown':
         _appendTurn(convKey, { role: 'assistant', content: `Stopping \`${(call.input as { repo: string }).repo}\`` });
@@ -861,6 +919,13 @@ async function _chainIfNeeded(
     if (next.type === 'text') {
       await post(ctx.client, ctx.channel, ctx.threadTs, next.text);
       _appendTurn(convKey, { role: 'assistant', content: next.text });
+      return;
+    }
+
+    // Deploy is confirmation-gated but can be handed off cleanly into the
+    // normal deploy approval prompt instead of failing the chain.
+    if (next.call.name === 'deploy') {
+      await promptForDeployCall(next.call, ctx, convKey);
       return;
     }
 
@@ -1066,10 +1131,11 @@ async function handleInfoTool(
     // give a clean prompt to ask again.
     let gatedMsg: string;
     if (next.call.name === 'deploy') {
-      const di = (next.call as { name: 'deploy'; input: { repo: string; branch: string; port: number } }).input;
-      gatedMsg = `I've finished checking the repo. Here's what I'd run:\n\n` +
-        `*Repo:* \`${di.repo}\`  *Branch:* \`${di.branch ?? 'main'}\`  *Port:* \`${di.port}\`\n\n` +
-        `Ready to deploy? Just say *yes* and I'll kick it off.`;
+      gatedMsg = `✓ ${prevName} done — creating the deploy confirmation...`;
+      await update(ctx.client, ctx.channel, ts, gatedMsg);
+      _appendTurn(convKey, { role: 'assistant', content: gatedMsg });
+      await promptForDeployCall(next.call, ctx, convKey);
+      return;
     } else {
       gatedMsg = `_I'd like to run \`${next.call.name}\` next but it needs its own confirmation — ask me to do that as a follow-up._`;
     }
@@ -1641,7 +1707,7 @@ async function quickHealthCheck(
 
 async function handleDeploy(
   { channel, threadTs, userId, client }: Ctx,
-  { repo, branch, port, freshUrl }: { repo: string; branch: string; port: number; freshUrl?: boolean },
+  { repo, branch, port, freshUrl, skipAnalysis, analysisOverrideReason }: { repo: string; branch: string; port: number; freshUrl?: boolean; skipAnalysis?: boolean; analysisOverrideReason?: string },
   convKey: string,
 ): Promise<void> {
   const actor = userId ? `<@${userId}>` : 'someone';
@@ -1652,13 +1718,30 @@ async function handleDeploy(
   );
 
   let analysis;
-  try {
-    analysis = await runDeployAnalysis(repo, branch);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.warn({ action: 'deploy:analysis_error', repo, err: msg }, 'Analysis threw — proceeding anyway');
-    // Non-fatal: if analysis itself errors, don't block the deploy
-    analysis = { eligible: true, detectedPort: null, blockers: [], warnings: [], claudeCodePrompt: null };
+  if (skipAnalysis) {
+    await recordAuditEvent({
+      action: 'deploy:analysis_override',
+      actor: userId ?? 'unknown',
+      surface: 'slack',
+      target: repo,
+      metadata: { reason: analysisOverrideReason ?? 'manual override' },
+    });
+    analysis = {
+      eligible: true,
+      detectedPort: null,
+      blockers: [],
+      warnings: [{ issue: 'Pre-deploy analysis skipped by Daanish override', suggestion: analysisOverrideReason ?? 'Manual override' }],
+      claudeCodePrompt: null,
+    };
+  } else {
+    try {
+      analysis = await runDeployAnalysis(repo, branch);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn({ action: 'deploy:analysis_error', repo, err: msg }, 'Analysis threw — proceeding anyway');
+      // Non-fatal: if analysis itself errors, don't block the deploy
+      analysis = { eligible: true, detectedPort: null, blockers: [], warnings: [], claudeCodePrompt: null };
+    }
   }
 
   // If blockers found — stop here, give developer a fix prompt
@@ -1671,7 +1754,11 @@ async function handleDeploy(
       ? `\n\n*Fix it with Claude Code — paste this into your terminal inside the \`${repo}\` repo:*\n\`\`\`\nclaud -p "${analysis.claudeCodePrompt.replace(/"/g, '\\"')}"\n\`\`\``
       : '';
 
-    const msg = `❌ *\`${repo}\` is not ready to deploy* — ${analysis.blockers.length} blocker(s) found:\n\n${blockerLines}${promptBlock}\n\n_Fix the issues above, then ask me to deploy again._`;
+    _setPendingDeployOverride(convKey, {
+      name: 'deploy',
+      input: { repo, branch, port, freshUrl },
+    }, analysis.blockers.map((b) => b.issue), userId);
+    const msg = `❌ *\`${repo}\` is not ready to deploy* — ${analysis.blockers.length} blocker(s) found:\n\n${blockerLines}${promptBlock}\n\n_Fix the issues above, then ask me to deploy again. If this is a false positive, <@${APPROVER_ID}> can say “override deploy” or “continue anyway” in this thread._`;
     await update(client, channel, ts, msg);
     _appendTurn(convKey, { role: 'assistant', content: msg });
     return;
@@ -2178,8 +2265,17 @@ async function handleInjectSecret(
       { repo, secretName: secret_name },
       { actor: ctx.userId ?? 'unknown', surface: 'slack' },
     );
-    const result = `Successfully wired secret "${injected.secretName}" into service "${repo}" as env var "${injected.envVarName}". A new ECS deployment was triggered.`;
-    await update(ctx.client, ctx.channel, ts, `✓ injected \`${injected.secretName}\` into \`${repo}\` as \`${injected.envVarName}\``);
+    const result = injected.alreadyInjected
+      ? `Secret "${injected.secretName}" is already wired into service "${repo}" as env var "${injected.envVarName}". No new ECS deployment was needed.`
+      : `Successfully wired secret "${injected.secretName}" into service "${repo}" as env var "${injected.envVarName}". A new ECS deployment was triggered.`;
+    await update(
+      ctx.client,
+      ctx.channel,
+      ts,
+      injected.alreadyInjected
+        ? `✓ \`${injected.secretName}\` is already injected into \`${repo}\` as \`${injected.envVarName}\``
+        : `✓ injected \`${injected.secretName}\` into \`${repo}\` as \`${injected.envVarName}\``,
+    );
     return result;
   } catch (err) {
     const result = `Failed to inject secret "${secret_name}" into "${repo}": ${err instanceof Error ? err.message : String(err)}`;
