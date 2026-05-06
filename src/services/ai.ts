@@ -538,8 +538,8 @@ const TOOLS: Anthropic.Tool[] = [
     name: 'bash',
     description:
       'Execute a bash command on the Tangent EC2 — the same host Tangent runs on. ' +
-      '*ONLY Daanish (U07EU7KSG3U) can call this, and ONLY in a DM with Tangent.* ' +
-      'Every invocation triggers a confirmation prompt that shows Daanish the exact command before it runs — Daanish must reply "yes" to execute. ' +
+      '*ONLY Daanish (U07EU7KSG3U) can call this, but he can use it in DMs, channels, or threads.* ' +
+      'When Daanish asks you to investigate host/runtime state, call bash directly; its output is fed back into the agent loop so you can continue reasoning and run the next diagnostic command when useful. ' +
       'Use this for ops tasks that previously required SSH: editing /etc/postgresql/15/main/pg_hba.conf, reloading services (e.g. `sudo -u postgres psql -c "SELECT pg_reload_conf();"`), inspecting disk usage, tailing /var/log files, running pg_dump, checking systemd unit status, etc. ' +
       'Tangent runs as user `ubuntu` which has passwordless `sudo` on this AMI — `sudo` works in any command. ' +
       'Hard caps: 60s timeout (default; max 600s), 8KB stdout/stderr cap each, no interactive input, no shell pipes are special — the command is passed to `bash -c`. ' +
@@ -605,6 +605,7 @@ Your primary superpower is DevOps: deploy services, monitor them, tear them down
 - edit_file: use for ALL small, targeted edits to existing files (renaming a variable, fixing an env var name, swapping a port, updating a constant, fixing a typo, replacing a couple of lines). The substitution runs server-side — file content never passes through your context, so nothing can be lost. Workflow: optionally read_file to see what's there, then edit_file with a unique \`find\` snippet and the new \`replace\` text. Always prefer this over read_file + push_file for edits.
 - Recovering deleted/overwritten files: Use list_commits with the file path to find the last good commit SHA, then call restore_file with that SHA. NEVER use read_file + push_file for recovery — content gets lost through the LLM context window. restore_file does it atomically server-side.
 - Secret injection: use \`inject_secret\`, not \`bash\`, for ECS task-definition secret wiring. If a secret has a service-specific name but the app expects a generic env var, pass \`env_var_name\` as an alias. Example: wire \`tangent/IRIS_SLACK_BOT_TOKEN\` into repo \`iris\` with \`env_var_name: "SLACK_BOT_TOKEN"\`.
+- Bash: only Daanish can use \`bash\`, but he can use it from channels/threads as well as DMs. For investigations, run the useful diagnostic command directly, read the output, then continue with another tool/command or summarize the finding. Do not ask Daanish for a separate "yes" before every bash command.
 
 *Deploy flow — read carefully:*
 - When asked to "deploy", "ship", "launch", or "help me deploy" a repo, the correct sequence is:

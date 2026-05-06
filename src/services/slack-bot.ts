@@ -634,36 +634,15 @@ async function _routeInner(
   }
 
   if (call.name === 'bash') {
-    // ── Triple gate: Daanish-only + DM-only + confirmation prompt ─────────
+    // Bash is Daanish-only, but it can run from any Slack surface so ops
+    // debugging can happen in the incident thread that has the context.
     if (ctx.userId !== APPROVER_ID) {
       const msg = '🔒 Only Daanish can run shell commands on the Tangent host.';
       await post(ctx.client, ctx.channel, ctx.threadTs, msg);
       _appendTurn(convKey, { role: 'assistant', content: msg });
       return;
     }
-    if (source !== 'dm') {
-      const msg = '🔒 The `bash` tool only works in a DM with me — not in channels or threads. DM me directly and we can run it there.';
-      await post(ctx.client, ctx.channel, ctx.threadTs, msg);
-      _appendTurn(convKey, { role: 'assistant', content: msg });
-      return;
-    }
-
-    const { command, reason, timeout_seconds } = call.input as { command: string; reason: string; timeout_seconds?: number };
-    const timeoutS = timeout_seconds ?? 60;
-    const prompt = [
-      `🖥️ *About to run a shell command on the Tangent EC2 (${config().pgHostInternalIp})*`,
-      `*Reason:* ${reason}`,
-      `*Timeout:* ${timeoutS}s`,
-      '',
-      '```',
-      command,
-      '```',
-      '',
-      'Reply *yes* to execute or *no* to cancel.',
-    ].join('\n');
-    _setPending(convKey, call, prompt, APPROVER_ID, ctx.userId);
-    await post(ctx.client, ctx.channel, ctx.threadTs, prompt);
-    _appendTurn(convKey, { role: 'assistant', content: prompt });
+    await executeToolCall(call, ctx, convKey, text, history);
     return;
   }
 
@@ -855,7 +834,8 @@ async function executeToolCall(
       break;
     }
     case 'bash': {
-      await handleBash(ctx, call.input as { command: string; reason: string; timeout_seconds?: number }, convKey);
+      const result = await handleBash(ctx, call.input as { command: string; reason: string; timeout_seconds?: number }, convKey);
+      await _chainIfNeeded(call, result, ctx, convKey, userMessage, history);
       break;
     }
     default:
@@ -928,12 +908,18 @@ async function _chainIfNeeded(
       return;
     }
 
-    // Confirmation-gated tools (bash, teardown) can't be dispatched inline
-    // because they need a human "yes" before executing.  Break out of the
-    // chain cleanly and hand off to executeToolCall — the confirmation prompt
-    // appears normally and the user can approve it as a follow-up.
-    if (next.call.name === 'bash' || next.call.name === 'teardown') {
+    // Bash is Daanish-only but no longer confirmation-gated, so it can be
+    // part of an investigation loop. It keeps the original user request in
+    // chain context instead of a bare "yes".
+    if (next.call.name === 'bash') {
       await executeToolCall(next.call, ctx, convKey, userMessage, history, step + 1);
+      return;
+    }
+
+    if (next.call.name === 'teardown') {
+      const msg = '_Teardown still needs its own explicit confirmation. Ask me to stop the service if you want to proceed._';
+      await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+      _appendTurn(convKey, { role: 'assistant', content: msg });
       return;
     }
 
@@ -2502,10 +2488,8 @@ async function handleDbDropUser(
  *
  * Defense in depth:
  *   1. Daanish-only check (also enforced upstream in route())
- *   2. DM-only check (also enforced upstream)
- *   3. Confirmation gate already passed by the time we get here (route()
- *      sets _setPending; the consent classifier dispatches us only after
- *      Daanish replies "yes")
+ *   2. Audit log records every command, caller, exit code, duration, and
+ *      truncated output.
  *
  * Hard caps: 60s default timeout (max 600s), 8KB stdout/stderr each, no
  * stdin.  Audit-logs every invocation with the user ID, command, exit
