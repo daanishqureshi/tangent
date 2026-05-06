@@ -16,6 +16,7 @@ import {
   CreateServiceCommand,
   UpdateServiceCommand,
   DescribeServicesCommand,
+  ListServicesCommand,
   DescribeTaskDefinitionCommand,
   ListTaskDefinitionsCommand,
   type ContainerDefinition,
@@ -23,10 +24,15 @@ import {
   type Secret,
 } from '@aws-sdk/client-ecs';
 import {
+  DescribeInstancesCommand,
+  DescribeSecurityGroupsCommand,
+  DescribeSubnetsCommand,
+} from '@aws-sdk/client-ec2';
+import {
   CreateLogGroupCommand,
   PutRetentionPolicyCommand,
 } from '@aws-sdk/client-cloudwatch-logs';
-import { ecsClient, cwlClient } from '../services/aws.js';
+import { ecsClient, cwlClient, ec2Client } from '../services/aws.js';
 import { config } from '../config.js';
 import { getServiceUrl, setServiceUrlLater } from '../services/state.js';
 import { logger } from '../utils/logger.js';
@@ -199,13 +205,16 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
 
   // ─── Create or update service ─────────────────────────────────────────────
 
-  const networkConfig = {
-    awsvpcConfiguration: {
-      subnets: fargate.subnets,
-      securityGroups: [fargate.securityGroup],
-      assignPublicIp: fargate.assignPublicIp,
+  const networkConfig = await resolveServiceNetworkConfig();
+  logger.info(
+    {
+      action: 'deploy:network_config',
+      subnets: networkConfig.awsvpcConfiguration.subnets,
+      securityGroups: networkConfig.awsvpcConfiguration.securityGroups,
+      assignPublicIp: networkConfig.awsvpcConfiguration.assignPublicIp,
     },
-  };
+    'Resolved ECS network configuration',
+  );
 
   const serviceExists = await checkServiceExists(ecsClusterName, serviceName);
 
@@ -225,6 +234,7 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
       taskDefinition: taskDefArn,
       forceNewDeployment: true,
       desiredCount: 1,
+      networkConfiguration: networkConfig,
       deploymentConfiguration: deploymentConfig,
       availabilityZoneRebalancing: 'DISABLED',
     });
@@ -251,6 +261,176 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+interface ServiceNetworkConfig {
+  awsvpcConfiguration: {
+    subnets: string[];
+    securityGroups: string[];
+    assignPublicIp: 'ENABLED' | 'DISABLED';
+  };
+}
+
+async function resolveServiceNetworkConfig(): Promise<ServiceNetworkConfig> {
+  const cfg = config();
+  const configured: ServiceNetworkConfig = {
+    awsvpcConfiguration: {
+      subnets: cfg.fargate.subnets,
+      securityGroups: [cfg.fargate.securityGroup],
+      assignPublicIp: cfg.fargate.assignPublicIp,
+    },
+  };
+
+  const targetVpcId = await findVpcForPostgresHost(cfg.pgHostInternalIp);
+  if (!targetVpcId) {
+    logger.warn(
+      { action: 'deploy:network:no_target_vpc', pgHost: cfg.pgHostInternalIp },
+      'Could not find Postgres host VPC; using configured Fargate networking',
+    );
+    return configured;
+  }
+
+  if (await networkBelongsToVpc(
+    configured.awsvpcConfiguration.subnets,
+    configured.awsvpcConfiguration.securityGroups,
+    targetVpcId,
+  )) {
+    return configured;
+  }
+
+  const existingServiceNetwork = await findExistingServiceNetworkInVpc(targetVpcId);
+  if (existingServiceNetwork) {
+    logger.info({ action: 'deploy:network:existing_service', targetVpcId }, 'Using existing ECS service network in Postgres VPC');
+    return existingServiceNetwork;
+  }
+
+  const subnets = await findPublicSubnetsInVpc(targetVpcId);
+  if (subnets.length === 0) {
+    throw new Error(`Could not find usable Fargate subnets in Postgres VPC ${targetVpcId}`);
+  }
+
+  return {
+    awsvpcConfiguration: {
+      subnets,
+      securityGroups: await findConfiguredOrDefaultSecurityGroup(targetVpcId, configured.awsvpcConfiguration.securityGroups),
+      assignPublicIp: 'ENABLED',
+    },
+  };
+}
+
+async function findVpcForPostgresHost(privateIp: string): Promise<string | null> {
+  try {
+    const result = await ec2Client().send(new DescribeInstancesCommand({
+      Filters: [
+        { Name: 'private-ip-address', Values: [privateIp] },
+        { Name: 'instance-state-name', Values: ['pending', 'running', 'stopping', 'stopped'] },
+      ],
+    }));
+    return result.Reservations?.flatMap((r) => r.Instances ?? [])[0]?.VpcId ?? null;
+  } catch (err) {
+    logger.warn({ action: 'deploy:network:vpc_lookup_failed', err, privateIp }, 'Failed to look up Postgres host VPC');
+    return null;
+  }
+}
+
+async function networkBelongsToVpc(subnets: string[], securityGroups: string[], vpcId: string): Promise<boolean> {
+  try {
+    const [subnetResult, sgResult] = await Promise.all([
+      ec2Client().send(new DescribeSubnetsCommand({ SubnetIds: subnets })),
+      ec2Client().send(new DescribeSecurityGroupsCommand({ GroupIds: securityGroups })),
+    ]);
+    return (subnetResult.Subnets ?? []).length === subnets.length
+      && (sgResult.SecurityGroups ?? []).length === securityGroups.length
+      && (subnetResult.Subnets ?? []).every((s) => s.VpcId === vpcId)
+      && (sgResult.SecurityGroups ?? []).every((sg) => sg.VpcId === vpcId);
+  } catch {
+    return false;
+  }
+}
+
+async function findExistingServiceNetworkInVpc(vpcId: string): Promise<ServiceNetworkConfig | null> {
+  try {
+    const cfg = config();
+    const serviceArns: string[] = [];
+    let nextToken: string | undefined;
+
+    do {
+      const page = await ecsClient().send(new ListServicesCommand({
+        cluster: cfg.ecsClusterName,
+        maxResults: 10,
+        nextToken,
+      }));
+      serviceArns.push(...(page.serviceArns ?? []));
+      nextToken = page.nextToken;
+    } while (nextToken && serviceArns.length < 50);
+
+    for (let i = 0; i < serviceArns.length; i += 10) {
+      const described = await ecsClient().send(new DescribeServicesCommand({
+        cluster: cfg.ecsClusterName,
+        services: serviceArns.slice(i, i + 10),
+      }));
+
+      for (const svc of described.services ?? []) {
+        const net = svc.networkConfiguration?.awsvpcConfiguration;
+        const subnets = net?.subnets?.filter(Boolean) ?? [];
+        const securityGroups = net?.securityGroups?.filter(Boolean) ?? [];
+        if (subnets.length === 0 || securityGroups.length === 0) continue;
+        if (await networkBelongsToVpc(subnets, securityGroups, vpcId)) {
+          return {
+            awsvpcConfiguration: {
+              subnets,
+              securityGroups,
+              assignPublicIp: net?.assignPublicIp ?? 'ENABLED',
+            },
+          };
+        }
+      }
+    }
+  } catch (err) {
+    logger.warn({ action: 'deploy:network:existing_service_failed', err, vpcId }, 'Failed to find existing ECS service network');
+  }
+  return null;
+}
+
+async function findPublicSubnetsInVpc(vpcId: string): Promise<string[]> {
+  const result = await ec2Client().send(new DescribeSubnetsCommand({
+    Filters: [
+      { Name: 'vpc-id', Values: [vpcId] },
+      { Name: 'state', Values: ['available'] },
+    ],
+  }));
+
+  return (result.Subnets ?? [])
+    .filter((s) => s.MapPublicIpOnLaunch)
+    .sort((a, b) => (b.AvailableIpAddressCount ?? 0) - (a.AvailableIpAddressCount ?? 0))
+    .map((s) => s.SubnetId)
+    .filter((id): id is string => Boolean(id))
+    .slice(0, 3);
+}
+
+async function findConfiguredOrDefaultSecurityGroup(vpcId: string, configuredSecurityGroups: string[]): Promise<string[]> {
+  if (configuredSecurityGroups.length > 0) {
+    try {
+      const result = await ec2Client().send(new DescribeSecurityGroupsCommand({ GroupIds: configuredSecurityGroups }));
+      const matching = (result.SecurityGroups ?? [])
+        .filter((sg) => sg.VpcId === vpcId)
+        .map((sg) => sg.GroupId)
+        .filter((id): id is string => Boolean(id));
+      if (matching.length > 0) return matching;
+    } catch {
+      // Fall through to default SG lookup.
+    }
+  }
+
+  const defaults = await ec2Client().send(new DescribeSecurityGroupsCommand({
+    Filters: [
+      { Name: 'vpc-id', Values: [vpcId] },
+      { Name: 'group-name', Values: ['default'] },
+    ],
+  }));
+  const defaultGroup = defaults.SecurityGroups?.[0]?.GroupId;
+  if (!defaultGroup) throw new Error(`Could not find a security group in Postgres VPC ${vpcId}`);
+  return [defaultGroup];
+}
 
 /**
  * Create the CloudWatch log group if it doesn't already exist.
