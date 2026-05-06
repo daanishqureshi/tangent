@@ -2068,11 +2068,11 @@ async function fetchLogs(repo: string, container: string): Promise<string> {
       const r = await cwlClient().send(new DescribeLogStreamsCommand({
         logGroupName,
         logStreamNamePrefix: logStreamPrefix,
-        orderBy: 'LastEventTime',
-        descending: true,
-        limit: 5,
+        limit: 50,
       }));
-      streams = r.logStreams ?? [];
+      streams = (r.logStreams ?? [])
+        .filter((s) => s.logStreamName)
+        .sort((a, b) => (b.lastEventTimestamp ?? 0) - (a.lastEventTimestamp ?? 0));
     } catch (err) {
       throw new Error(`CloudWatch unavailable: ${err instanceof Error ? err.message : String(err)}`);
     }
