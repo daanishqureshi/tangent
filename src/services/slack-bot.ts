@@ -817,7 +817,7 @@ async function executeToolCall(
       break;
     }
     case 'inject_secret': {
-      const result = await handleInjectSecret(ctx, call.input as { repo: string; secret_name: string }, convKey);
+      const result = await handleInjectSecret(ctx, call.input as { repo: string; secret_name: string; env_var_name?: string }, convKey);
       await _chainIfNeeded(call, result, ctx, convKey, userMessage, history);
       break;
     }
@@ -855,8 +855,7 @@ async function executeToolCall(
       break;
     }
     case 'bash': {
-      const result = await handleBash(ctx, call.input as { command: string; reason: string; timeout_seconds?: number }, convKey);
-      await _chainIfNeeded(call, result, ctx, convKey, userMessage, history);
+      await handleBash(ctx, call.input as { command: string; reason: string; timeout_seconds?: number }, convKey);
       break;
     }
     default:
@@ -991,7 +990,7 @@ async function dispatchChainedTool(
     case 'put_secret':
       return handlePutSecret(ctx, call.input as { name: string; value: string; description?: string }, convKey);
     case 'inject_secret':
-      return handleInjectSecret(ctx, call.input as { repo: string; secret_name: string }, convKey);
+      return handleInjectSecret(ctx, call.input as { repo: string; secret_name: string; env_var_name?: string }, convKey);
     case 'db_create_user':
       return handleDbCreateUser(ctx, call.input as { username: string; create_database?: boolean }, convKey);
     case 'db_drop_user':
@@ -2254,15 +2253,16 @@ async function fetchDiscover(): Promise<string> {
 
 async function handleInjectSecret(
   ctx: Ctx,
-  input: { repo: string; secret_name: string },
+  input: { repo: string; secret_name: string; env_var_name?: string },
   convKey: string,
 ): Promise<string> {
-  const { repo, secret_name } = input;
-  const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Wiring \`${secret_name}\` into \`${repo}\`...`);
+  const { repo, secret_name, env_var_name } = input;
+  const aliasNote = env_var_name ? ` as \`${env_var_name}\`` : '';
+  const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Wiring \`${secret_name}\` into \`${repo}\`${aliasNote}...`);
 
   try {
     const injected = await injectSecretIntoService(
-      { repo, secretName: secret_name },
+      { repo, secretName: secret_name, envVarName: env_var_name },
       { actor: ctx.userId ?? 'unknown', surface: 'slack' },
     );
     const result = injected.alreadyInjected

@@ -37,7 +37,7 @@ export type AgentToolCall =
   | { name: 'allow_user';    input: { user_id: string; display_name: string } }
   | { name: 'list_secrets';    input: Record<string, never> }
   | { name: 'put_secret';     input: { name: string; value: string; description?: string } }
-  | { name: 'inject_secret';  input: { repo: string; secret_name: string } }
+  | { name: 'inject_secret';  input: { repo: string; secret_name: string; env_var_name?: string } }
   | { name: 'remember_person'; input: { user_id: string; name: string; note: string } }
   | { name: 'read_file';      input: { repo: string; path: string; ref?: string } }
   | { name: 'list_commits';   input: { repo: string; path?: string; limit?: number } }
@@ -240,13 +240,15 @@ const TOOLS: Anthropic.Tool[] = [
       'Wire a secret from AWS Secrets Manager as an environment variable into a deployed ECS service. ' +
       'Use when someone says "inject X into repo Y", "wire secret X to service Y", "add env var X from secrets manager to Y", ' +
       'or when a service is crashing because it cannot find a secret/env var. ' +
+      'Supports aliasing: pass env_var_name when a namespaced secret should appear under a different variable inside the container, e.g. tangent/IRIS_SLACK_BOT_TOKEN -> SLACK_BOT_TOKEN. ' +
       'This re-registers the task definition with the secret injected and force-deploys the service — no code change needed. ' +
       'repo is the repository/service name. secret_name is the exact secret name in Secrets Manager (e.g. "ASANA_PAT").',
     input_schema: {
       type: 'object' as const,
       properties: {
         repo:        { type: 'string', description: 'Repository/service name, e.g. "asana-hubspot-webhook"' },
-        secret_name: { type: 'string', description: 'Exact secret name in Secrets Manager, e.g. "ASANA_PAT"' },
+        secret_name: { type: 'string', description: 'Exact secret name in Secrets Manager, e.g. "ASANA_PAT" or "tangent/IRIS_SLACK_BOT_TOKEN"' },
+        env_var_name: { type: 'string', description: 'Optional env var name to expose inside the container. Use this for aliases, e.g. secret tangent/IRIS_SLACK_BOT_TOKEN as env var SLACK_BOT_TOKEN.' },
       },
       required: ['repo', 'secret_name'],
     },
@@ -543,7 +545,7 @@ const TOOLS: Anthropic.Tool[] = [
       'Hard caps: 60s timeout (default; max 600s), 8KB stdout/stderr cap each, no interactive input, no shell pipes are special — the command is passed to `bash -c`. ' +
       'You MUST include a short `reason` field explaining what the command is supposed to accomplish so the confirmation prompt is human-readable. ' +
       'Do NOT use this to modify Tangent\'s OWN source code (use edit_self / push_self / read_self). ' +
-      'Do NOT use this to bypass other gated tools (e.g. running `aws ecs ...` to deploy when there is a deploy tool, or `psql` to drop a role when there is a db_drop_user tool). Each existing tool is the canonical path for its action. ' +
+      'Do NOT use this to bypass other gated tools (e.g. running `aws ecs ...` to deploy when there is a deploy tool, using AWS CLI to inject ECS secrets when there is an inject_secret tool, or `psql` to drop a role when there is a db_drop_user tool). Each existing tool is the canonical path for its action. ' +
       'Do NOT use this for tasks that don\'t require host access (file reads in repos → use read_file; secret listing → use list_secrets).',
     input_schema: {
       type: 'object' as const,
@@ -602,6 +604,7 @@ Your primary superpower is DevOps: deploy services, monitor them, tear them down
 - push_file: use ONLY for creating brand-new files or rewriting trivially small files. ZERO approval needed for new files. When asked to add a Dockerfile / config / new source file, call push_file IMMEDIATELY — don't narrate, just call it. NEVER use push_file to make a small change to an existing larger file: regenerating an entire file through the LLM risks truncation, "rest unchanged" placeholders, or accidentally emptying the file. Use edit_file instead.
 - edit_file: use for ALL small, targeted edits to existing files (renaming a variable, fixing an env var name, swapping a port, updating a constant, fixing a typo, replacing a couple of lines). The substitution runs server-side — file content never passes through your context, so nothing can be lost. Workflow: optionally read_file to see what's there, then edit_file with a unique \`find\` snippet and the new \`replace\` text. Always prefer this over read_file + push_file for edits.
 - Recovering deleted/overwritten files: Use list_commits with the file path to find the last good commit SHA, then call restore_file with that SHA. NEVER use read_file + push_file for recovery — content gets lost through the LLM context window. restore_file does it atomically server-side.
+- Secret injection: use \`inject_secret\`, not \`bash\`, for ECS task-definition secret wiring. If a secret has a service-specific name but the app expects a generic env var, pass \`env_var_name\` as an alias. Example: wire \`tangent/IRIS_SLACK_BOT_TOKEN\` into repo \`iris\` with \`env_var_name: "SLACK_BOT_TOKEN"\`.
 
 *Deploy flow — read carefully:*
 - When asked to "deploy", "ship", "launch", or "help me deploy" a repo, the correct sequence is:
@@ -982,6 +985,7 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
       return { name: 'inject_secret', input: {
         repo:        String(raw['repo']        ?? ''),
         secret_name: String(raw['secret_name'] ?? ''),
+        env_var_name: raw['env_var_name'] != null ? String(raw['env_var_name']) : undefined,
       }};
     case 'remember_person':
       return { name: 'remember_person', input: {
