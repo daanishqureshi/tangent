@@ -149,6 +149,11 @@ function isDeployOverrideIntent(text: string): boolean {
 // repeated/duplicated actions (e.g. saving the same secret three times).
 //
 const _processingLock = new Set<string>();
+const _cancelRequested = new Set<string>();
+
+function isStopIntent(text: string): boolean {
+  return /^(?:stop|cancel|abort|halt|quit|stop spamming|please stop)\b/i.test(text.trim());
+}
 
 // Consent classification is handled by classifyConsent() in ai.ts (Claude haiku).
 // These stubs remain for call-site compatibility but are no longer used directly —
@@ -483,6 +488,12 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
   // tool calls), don't start another pass — the follow-up will just duplicate
   // work.  Post a brief "still working" note so the user knows we heard them.
   if (_processingLock.has(convKey)) {
+    if (isStopIntent(text)) {
+      _cancelRequested.add(convKey);
+      logger.info({ action: 'route:cancel_requested', convKey }, 'Cancellation requested for active chain');
+      await post(ctx.client, ctx.channel, ctx.threadTs, '_Stopping the active tool chain after the current command finishes._');
+      return;
+    }
     logger.info({ action: 'route:busy', convKey }, 'Skipping — already processing');
     await post(ctx.client, ctx.channel, ctx.threadTs, '_Still working on the last request — hang tight._');
     return;
@@ -493,6 +504,7 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
     await _routeInner(ctx, text, source, messageTs, resolvedUserId, convKey);
   } finally {
     _processingLock.delete(convKey);
+    _cancelRequested.delete(convKey);
   }
 }
 
@@ -856,6 +868,23 @@ async function executeToolCall(
  * Claude getting stuck in a loop or running away on a long chain.
  */
 const MAX_TOOL_CHAIN_LENGTH = 30;
+const MAX_ACTION_CHAIN_LENGTH = 8;
+
+function toolSignature(call: AgentToolCall): string {
+  return `${call.name}:${JSON.stringify(call.input)}`;
+}
+
+function isMutatingChainTool(name: AgentToolCall['name']): boolean {
+  return ['put_secret', 'inject_secret', 'db_create_user', 'db_drop_user', 'bash'].includes(name);
+}
+
+function actionResultFailed(result: string): boolean {
+  return /(?:^|\n)(?:❌|Failed to|Query failed:|exit_code:\s*(?!0\b)\d+|Exit\s+(?!0\b)\d+)/i.test(result);
+}
+
+function chainCancelledMessage(): string {
+  return '_Stopped the active tool chain._';
+}
 
 /**
  * After an action tool completes, ask Claude what's next.  If Claude wants
@@ -878,12 +907,29 @@ async function _chainIfNeeded(
   history: ConversationTurn[],
 ): Promise<void> {
   const chain: ToolChainStep[] = [{ call: completedCall, result: toolResult }];
+  const seenActionCalls = new Set<string>();
+  if (isMutatingChainTool(completedCall.name)) seenActionCalls.add(toolSignature(completedCall));
+
   // Append the just-completed action's result to the in-memory conv store
   // so future, separate user messages have it in their history.  This is
   // narrative-only; the chain array is what continueAfterTool actually uses.
   _appendTurn(convKey, { role: 'assistant', content: `${completedCall.name} result: ${toolResult}` });
 
-  for (let step = 0; step < MAX_TOOL_CHAIN_LENGTH; step++) {
+  if (isMutatingChainTool(completedCall.name) && actionResultFailed(toolResult)) {
+    const msg = `_Stopping tool chain because \`${completedCall.name}\` failed. I won't retry failed mutating actions automatically._`;
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return;
+  }
+
+  for (let step = 0; step < MAX_ACTION_CHAIN_LENGTH; step++) {
+    if (_cancelRequested.has(convKey)) {
+      const msg = chainCancelledMessage();
+      await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+      _appendTurn(convKey, { role: 'assistant', content: msg });
+      return;
+    }
+
     let next;
     try {
       next = await continueAfterTool(chain, undefined, userMessage, history);
@@ -899,6 +945,17 @@ async function _chainIfNeeded(
       await post(ctx.client, ctx.channel, ctx.threadTs, next.text);
       _appendTurn(convKey, { role: 'assistant', content: next.text });
       return;
+    }
+
+    if (isMutatingChainTool(next.call.name)) {
+      const signature = toolSignature(next.call);
+      if (seenActionCalls.has(signature)) {
+        const msg = `_Stopped before repeating \`${next.call.name}\` with the same inputs. Ask me to retry explicitly if you want another attempt._`;
+        await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+        _appendTurn(convKey, { role: 'assistant', content: msg });
+        return;
+      }
+      seenActionCalls.add(signature);
     }
 
     // Deploy is confirmation-gated but can be handed off cleanly into the
@@ -942,10 +999,17 @@ async function _chainIfNeeded(
 
     chain.push({ call: next.call, result: nextResult });
     _appendTurn(convKey, { role: 'assistant', content: `${next.call.name} result: ${nextResult}` });
+
+    if (isMutatingChainTool(next.call.name) && actionResultFailed(nextResult)) {
+      const msg = `_Stopping tool chain because \`${next.call.name}\` failed. I won't retry failed mutating actions automatically._`;
+      await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+      _appendTurn(convKey, { role: 'assistant', content: msg });
+      return;
+    }
   }
 
   // Hit the safety cap
-  const cap = `_Stopped after ${MAX_TOOL_CHAIN_LENGTH} chained tool calls — that's the safety cap. Last call: \`${chain[chain.length - 1].call.name}\`. Ask again if you want me to continue._`;
+  const cap = `_Stopped after ${MAX_ACTION_CHAIN_LENGTH} chained action calls — that's the safety cap. Last call: \`${chain[chain.length - 1].call.name}\`. Ask again if you want me to continue._`;
   await post(ctx.client, ctx.channel, ctx.threadTs, cap);
   _appendTurn(convKey, { role: 'assistant', content: cap });
 }
