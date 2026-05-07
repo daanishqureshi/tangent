@@ -1869,7 +1869,7 @@ async function handleDeploy(
   } catch (err) {
     let msg: string;
     if (err instanceof DockerfileNotFoundError) msg = err.message;
-    else if (err instanceof DockerBuildError)   msg = `${err.summary}\n\`\`\`${err.raw.slice(0, 600)}\`\`\``;
+    else if (err instanceof DockerBuildError)   msg = `${err.summary}\n\`\`\`${tailForSlack(err.raw, 2200)}\`\`\``;
     else                                        msg = err instanceof Error ? err.message : String(err);
     await update(client, channel, ts, `❌ Build failed for \`${repo}\``, errorBlocks('❌ Build failed', repo, msg));
     _appendTurn(convKey, { role: 'assistant', content: `❌ Build failed for \`${repo}\`: ${msg}` });
@@ -1932,6 +1932,11 @@ async function handleDeploy(
   void quickHealthCheck(client, channel, threadTs, convKey, repo, url).catch((err) => {
     logger.error({ action: 'health_check:crash', err }, 'Post-deploy health check failed');
   });
+}
+
+function tailForSlack(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `...[showing last ${maxChars} chars]\n${text.slice(-maxChars)}`;
 }
 
 // ─── Teardown ─────────────────────────────────────────────────────────────────

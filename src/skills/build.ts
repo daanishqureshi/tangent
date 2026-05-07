@@ -64,7 +64,7 @@ export async function buildSkill(input: BuildInput): Promise<BuildOutput> {
     try {
       await dockerBuild(cloneDir, imageUri);
     } catch (err) {
-      const raw = extractStderr(err);
+      const raw = extractCommandOutput(err);
       const summary = await summarizeBuildError(raw, repo);
       throw new DockerBuildError(`Docker build failed for ${repo}`, summary, raw);
     }
@@ -104,9 +104,14 @@ export class DockerBuildError extends Error {
   }
 }
 
-function extractStderr(err: unknown): string {
-  if (err instanceof Error && 'stderr' in err) {
-    return String((err as { stderr: string }).stderr);
+function extractCommandOutput(err: unknown): string {
+  if (err instanceof Error) {
+    const output = err as { stdout?: string; stderr?: string };
+    const parts = [
+      output.stdout ? `stdout:\n${output.stdout}` : '',
+      output.stderr ? `stderr:\n${output.stderr}` : '',
+    ].filter(Boolean);
+    if (parts.length > 0) return parts.join('\n\n');
   }
   return String(err);
 }

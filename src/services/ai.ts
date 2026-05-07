@@ -1687,12 +1687,13 @@ function buildDeployFixPrompt(repo: string, blockers: DeployBlocker[], pgHostInt
 export async function summarizeBuildError(stderr: string, repo: string): Promise<string> {
   logger.info({ action: 'ai:summarize_build_error', repo }, 'Requesting build error summary');
   try {
+    const tail = stderr.length > 12_000 ? stderr.slice(-12_000) : stderr;
     const msg = await withRetry(() => client().messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 300,
+      max_tokens: 450,
       messages: [{
         role: 'user',
-        content: `A Docker build for the repo "${repo}" failed. Here is the build output:\n\`\`\`\n${stderr.slice(0, 4000)}\n\`\`\`\n\nIn 1-3 sentences, explain what went wrong and what the engineer should do to fix it. Be specific — mention file names, package names, or version numbers if they appear. No preamble.`,
+        content: `A Docker build for the repo "${repo}" failed. The most useful error is usually near the END of Docker output, so this is the tail of the build log:\n\`\`\`\n${tail}\n\`\`\`\n\nIn 1-3 sentences, explain the actual failing command and what the engineer should do to fix it. Ignore unrelated warnings unless they are the direct cause. Be specific — mention file names, package names, or version numbers if they appear. No preamble.`,
       }],
     }), 'summarizeBuildError');
     const block = msg.content[0];
