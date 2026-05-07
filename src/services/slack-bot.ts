@@ -680,6 +680,11 @@ async function promptForDeployCall(call: AgentToolCall, ctx: Ctx, convKey: strin
   } catch {
     allRepos = [];
   }
+  const resolvedRepo = resolveRepoNameFromList(repo, allRepos);
+  if (resolvedRepo) {
+    repo = resolvedRepo;
+    (call.input as { repo: string }).repo = resolvedRepo;
+  }
   const repoExists = allRepos.some((r) => r.name.toLowerCase() === repo.toLowerCase());
 
   if (!repoExists) {
@@ -736,6 +741,28 @@ async function promptForDeployCall(call: AgentToolCall, ctx: Ctx, convKey: strin
   if (ctx.channel !== DEPLOY_CHANNEL) {
     const notif = `📣 Deploy request for \`${repo}\` (from ${requester}) — awaiting approval.`;
     await post(ctx.client, DEPLOY_CHANNEL, DEPLOY_CHANNEL, notif);
+  }
+}
+
+function compactRepoName(repo: string): string {
+  return repo.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function resolveRepoNameFromList(repo: string, repos: { name: string }[]): string | null {
+  const exact = repos.find((r) => r.name.toLowerCase() === repo.toLowerCase());
+  if (exact) return exact.name;
+
+  const compact = compactRepoName(repo);
+  const matches = repos.filter((r) => compactRepoName(r.name) === compact);
+  return matches.length === 1 ? matches[0].name : null;
+}
+
+async function resolveRepoName(repo: string): Promise<string> {
+  try {
+    const repos = await listAllRepos();
+    return resolveRepoNameFromList(repo, repos) ?? repo;
+  } catch {
+    return repo;
   }
 }
 
@@ -1517,6 +1544,11 @@ async function handleSelfPush(
  * No Slack posting here; that's the synthesizer's job.
  */
 async function fetchToolData(call: AgentToolCall): Promise<string> {
+  const input = call.input as Record<string, unknown>;
+  if (typeof input.repo === 'string') {
+    input.repo = await resolveRepoName(input.repo);
+  }
+
   switch (call.name) {
     case 'status':
       return fetchStatus((call.input as { repo: string }).repo);

@@ -26,7 +26,7 @@ export async function statusRoutes(app: FastifyInstance): Promise<void> {
         type: 'object',
         required: ['repo'],
         properties: {
-          repo: { type: 'string', minLength: 1, maxLength: 100, pattern: '^[a-z0-9-]+$' },
+          repo: { type: 'string', minLength: 1, maxLength: 100, pattern: '^[a-z0-9._-]+$' },
         },
       },
     },

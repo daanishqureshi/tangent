@@ -110,7 +110,7 @@ const TOOLS: Anthropic.Tool[] = [
     input_schema: {
       type: 'object' as const,
       properties: {
-        repo:     { type: 'string', description: 'Repository name, lowercase with hyphens, e.g. "my-cool-tool"' },
+        repo:     { type: 'string', description: 'Repository name. Use the exact name from GitHub — preserve underscores, hyphens, and dots, e.g. "product_demos", "my-cool-tool", "next.js".' },
         branch:   { type: 'string', description: 'Git branch to build from. Default: "main"' },
         port:     { type: 'number', description: 'Port the app listens on inside the container. Default: 8080' },
         freshUrl: { type: 'boolean', description: 'Set true to generate a brand-new ngrok URL instead of reusing the existing one. Only use when the user explicitly asks for a new URL.' },
@@ -819,9 +819,11 @@ export async function processMessage(
 
       const raw = toolBlock.input as Record<string, unknown>;
 
-      // Normalize repo name to lowercase-hyphen format
+      // Normalize repo name: lowercase, spaces → hyphens.
+      // Keep underscores and dots — both are valid GitHub repo characters
+      // (e.g. `product_demos`, `next.js`).
       if (typeof raw['repo'] === 'string') {
-        raw['repo'] = raw['repo'].toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+        raw['repo'] = raw['repo'].toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9._-]/g, '');
       }
 
       logger.info({ action: 'ai:tool_call', tool: toolBlock.name, input: raw }, 'Tool called');

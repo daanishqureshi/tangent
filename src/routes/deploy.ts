@@ -31,7 +31,7 @@ export async function deployRoutes(app: FastifyInstance): Promise<void> {
         type: 'object',
         required: ['repo'],
         properties: {
-          repo: { type: 'string', minLength: 1, maxLength: 100, pattern: '^[a-z0-9-]+$' },
+          repo: { type: 'string', minLength: 1, maxLength: 100, pattern: '^[a-z0-9._-]+$' },
           branch: { type: 'string', default: 'main' },
           port: { type: 'integer', minimum: 1, maximum: 65535, default: 8080 },
         },
