@@ -26,6 +26,7 @@ import { runDeployAnalysis } from '../skills/analyze.js';
 import { deploySkill } from '../skills/deploy.js';
 import { tunnelSkill, TunnelTimeoutError } from '../skills/tunnel.js';
 import { teardownSkill } from '../skills/teardown.js';
+import { reviewRepo, formatReviewResult } from '../skills/review.js';
 import { scanSkill } from '../skills/scan.js';
 import { discoverSkill } from '../skills/discover.js';
 import { listAllRepos, inspectRepo, pushFile, readRepoFile, listCommits, editFile } from './github.js';
@@ -84,9 +85,9 @@ const DEPLOY_CHANNEL = 'C0AQZ16BKAN'; // #tangent-deployments
 // posts a confirmation prompt and stores the pending action here.
 // The NEXT message in that conversation either confirms or cancels it.
 //
-// Confirmations expire after 3 minutes of no response.
+// Confirmations expire after 10 minutes of no response.
 
-const CONFIRM_TTL_MS = 3 * 60 * 1000;
+const CONFIRM_TTL_MS = 10 * 60 * 1000;
 
 interface PendingConfirmation {
   call: AgentToolCall;
@@ -1072,12 +1073,15 @@ async function dispatchChainedTool(
       return handleDbCreateUser(ctx, call.input as { username: string; create_database?: boolean }, convKey);
     case 'db_drop_user':
       return handleDbDropUser(ctx, call.input as { username: string; drop_database?: boolean }, convKey);
+    case 'remember_person':
+      return handleRememberPerson(ctx, call.input as { user_id: string; name: string; note: string }, convKey);
     // Info / read-only tools — fetch raw data and return it; the caller
     // will feed it back to Claude via continueAfterTool for synthesis.
     case 'status':
     case 'list_services':
     case 'list_repos':
     case 'inspect_repo':
+    case 'review_repo':
     case 'read_file':
     case 'list_commits':
     case 'read_self':
@@ -1558,6 +1562,11 @@ async function fetchToolData(call: AgentToolCall): Promise<string> {
       return fetchListRepos();
     case 'inspect_repo':
       return fetchInspectRepo((call.input as { repo: string }).repo);
+    case 'review_repo': {
+      const { repo, branch, port } = call.input as { repo: string; branch?: string; port?: number };
+      const result = await reviewRepo({ repo, branch, port });
+      return formatReviewResult(result);
+    }
     case 'read_file': {
       const { repo, path, ref } = call.input as { repo: string; path: string; ref?: string };
       const content = await readRepoFile(repo, path, ref);
@@ -1708,10 +1717,11 @@ async function quickHealthCheck(
 
   let appLogs = '';
   let ngrokLogs = '';
+  const ecsDetails = await fetchStoppedTaskDetails(repo);
   try { appLogs   = await fetchLogs(repo, 'app');   } catch { appLogs   = '(app logs unavailable)'; }
   try { ngrokLogs = await fetchLogs(repo, 'ngrok'); } catch { ngrokLogs = '(ngrok logs unavailable)'; }
 
-  const diagnosis = await diagnoseServiceFailure(repo, appLogs, ngrokLogs, ngrokUrl);
+  const diagnosis = await diagnoseServiceFailure(repo, appLogs, ngrokLogs, ngrokUrl, ecsDetails);
 
   // ── Attempt auto-fix ───────────────────────────────────────────────────────
   // Try to identify the broken file, read it from GitHub, generate a minimal
@@ -1784,6 +1794,75 @@ async function quickHealthCheck(
   logger.info({ action: 'health_check:alerted', repo, autoFixed }, 'Health check alert posted');
 }
 
+async function fetchStoppedTaskDetails(repo: string): Promise<string> {
+  const { SERVICE_PREFIX } = await import('../utils/constants.js');
+  const { DescribeServicesCommand, DescribeTasksCommand, ListTasksCommand } = await import('@aws-sdk/client-ecs');
+  const { ecsClient } = await import('./aws.js');
+  const { ecsClusterName } = config();
+  const serviceName = `${SERVICE_PREFIX}${repo}`;
+
+  try {
+    const serviceResult = await ecsClient().send(
+      new DescribeServicesCommand({ cluster: ecsClusterName, services: [serviceName] }),
+    );
+    const service = serviceResult.services?.[0];
+    const serviceLines = [
+      `Service: ${serviceName}`,
+      `Status: ${service?.status ?? 'UNKNOWN'}`,
+      `Desired/running/pending: ${service?.desiredCount ?? 0}/${service?.runningCount ?? 0}/${service?.pendingCount ?? 0}`,
+      service?.taskDefinition ? `Task definition: ${service.taskDefinition}` : '',
+      '',
+      'Recent service events:',
+      ...(service?.events ?? []).slice(0, 6).map((event) => `- ${event.createdAt?.toISOString?.() ?? 'unknown time'}: ${event.message ?? '(no message)'}`),
+    ].filter(Boolean);
+
+    const listed = await ecsClient().send(
+      new ListTasksCommand({
+        cluster: ecsClusterName,
+        serviceName,
+        desiredStatus: 'STOPPED',
+        maxResults: 10,
+      }),
+    );
+
+    const taskArns = listed.taskArns ?? [];
+    if (taskArns.length === 0) {
+      return [...serviceLines, '', 'Recent stopped tasks: none returned by ECS.'].join('\n');
+    }
+
+    const described = await ecsClient().send(
+      new DescribeTasksCommand({ cluster: ecsClusterName, tasks: taskArns.slice(0, 10) }),
+    );
+
+    const taskLines = (described.tasks ?? []).map((task, index) => {
+      const containers = (task.containers ?? []).map((container) => {
+        const logStreamName = (container as { logStreamName?: string }).logStreamName;
+        return [
+        `  - container ${container.name ?? '(unknown)'}`,
+        `status=${container.lastStatus ?? 'unknown'}`,
+        container.exitCode != null ? `exit=${container.exitCode}` : '',
+        container.reason ? `reason=${container.reason}` : '',
+          logStreamName ? `log=${logStreamName}` : '',
+        ].filter(Boolean).join(' ');
+      });
+
+      return [
+        `Task ${index + 1}:`,
+        `stoppedAt: ${task.stoppedAt?.toISOString?.() ?? 'unknown'}`,
+        `stopCode: ${task.stopCode ?? 'unknown'}`,
+        `stoppedReason: ${task.stoppedReason ?? '(none)'}`,
+        ...containers,
+      ].join('\n');
+    });
+
+    return [...serviceLines, '', 'Recent stopped tasks:', ...taskLines].join('\n');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn({ action: 'health_check:stopped_task_details_failed', repo, err: message }, 'Failed to fetch stopped task details');
+    return `Could not fetch ECS stopped task details: ${message}`;
+  }
+}
+
 // ─── Deploy ───────────────────────────────────────────────────────────────────
 
 async function handleDeploy(
@@ -1797,6 +1876,41 @@ async function handleDeploy(
   const ts = await post(client, channel, threadTs,
     `🔍 Analyzing \`${repo}\` before deploy...`,
   );
+
+  if (!skipAnalysis) {
+    await update(client, channel, ts, `🔎 Running deploy/security review for \`${repo}\`...`);
+    const review = await reviewRepo({ repo, branch, port });
+    if (!review.canDeploy) {
+      const report = formatReviewResult(review);
+      _setPendingDeployOverride(convKey, {
+        name: 'deploy',
+        input: { repo, branch, port, freshUrl },
+      }, [
+        ...review.blockers.map((finding) => finding.title),
+        ...review.securityFindings.filter((finding) => finding.severity === 'blocker').map((finding) => finding.title),
+      ], userId);
+      const msg = [
+        `❌ *\`${repo}\` did not pass deploy review*`,
+        '',
+        report,
+        '',
+        `_Fix the blockers above, then ask me to deploy again. If this is a false positive, <@${APPROVER_ID}> can say “override deploy” or “continue anyway” in this thread._`,
+      ].join('\n');
+      await update(client, channel, ts, msg);
+      _appendTurn(convKey, { role: 'assistant', content: msg });
+      return;
+    }
+
+    const reviewWarningText = [
+      ...review.securityFindings.filter((finding) => finding.severity === 'warning').map((finding) => finding.title),
+      ...review.warnings.map((finding) => finding.title),
+    ].slice(0, 4);
+    if (reviewWarningText.length > 0) {
+      await update(client, channel, ts, `✓ Deploy/security review passed with warnings: ${reviewWarningText.join(' · ')}\n🔍 Running deploy analysis...`);
+    } else {
+      await update(client, channel, ts, `✓ Deploy/security review passed.\n🔍 Running deploy analysis...`);
+    }
+  }
 
   let analysis;
   if (skipAnalysis) {
@@ -2002,8 +2116,12 @@ async function fetchStatus(repo: string): Promise<string> {
     if (!healthy && running === 0 && desired > 0) {
       let appLogs = '';
       try { appLogs = await fetchLogs(repo, 'app'); } catch { appLogs = '(app logs unavailable)'; }
+      const ecsDetails = await fetchStoppedTaskDetails(repo);
       return [
         baseSummary,
+        '',
+        '--- ECS stopped task details ---',
+        ecsDetails,
         '',
         '--- Auto-fetched app logs (service has 0 running tasks) ---',
         appLogs,
@@ -2756,7 +2874,7 @@ async function handleRememberPerson(
   ctx: Ctx,
   input: { user_id: string; name: string; note: string },
   convKey: string,
-): Promise<void> {
+): Promise<string> {
   const { readFileSync, writeFileSync } = await import('fs');
   const { resolve } = await import('path');
   const { execSync } = await import('child_process');
@@ -2837,6 +2955,7 @@ async function handleRememberPerson(
   }
   await post(ctx.client, ctx.channel, ctx.threadTs, msg);
   _appendTurn(convKey, { role: 'assistant', content: msg });
+  return msg;
 }
 
 // ─── Block Kit helpers ────────────────────────────────────────────────────────

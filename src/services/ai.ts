@@ -28,6 +28,7 @@ export type AgentToolCall =
   | { name: 'list_services';   input: Record<string, never> }
   | { name: 'list_repos';      input: Record<string, never> }
   | { name: 'inspect_repo';    input: { repo: string } }
+  | { name: 'review_repo';     input: { repo: string; branch?: string; port?: number } }
   | { name: 'cve_scan';        input: Record<string, never> }
   | { name: 'discover_config'; input: Record<string, never> }
   | { name: 'logs';            input: { repo: string; container?: string } }
@@ -169,6 +170,23 @@ const TOOLS: Anthropic.Tool[] = [
       type: 'object' as const,
       properties: {
         repo: { type: 'string', description: 'Repository name to inspect, e.g. "chatbot-test"' },
+      },
+      required: ['repo'],
+    },
+  },
+  {
+    name: 'review_repo',
+    description:
+      'Run an evidence-based deploy and cybersecurity review for a GitHub repo before deploy. ' +
+      'This clones the repo, runs deterministic static checks, dependency/security scans, Docker build, and a local container smoke test shaped like ECS/Fargate. ' +
+      'Use whenever someone asks for code review, deploy readiness, "make sure it works", "will this run on ECS/Fargate", "check before deploy", "make sure no errors persist", or after code edits before redeploying. ' +
+      'Never claim a repo is deploy-ready from inspection alone — use this tool and summarize only the returned evidence.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        repo:   { type: 'string', description: 'Repository name to review. Use exact GitHub repo name.' },
+        branch: { type: 'string', description: 'Git branch to review. Default: "main".' },
+        port:   { type: 'number', description: 'Optional app container port if known. Otherwise the tool detects EXPOSE/defaults.' },
       },
       required: ['repo'],
     },
@@ -606,6 +624,7 @@ Your primary superpower is DevOps: deploy services, monitor them, tear them down
 - Recovering deleted/overwritten files: Use list_commits with the file path to find the last good commit SHA, then call restore_file with that SHA. NEVER use read_file + push_file for recovery — content gets lost through the LLM context window. restore_file does it atomically server-side.
 - Secret injection: use \`inject_secret\`, not \`bash\`, for ECS task-definition secret wiring. If a secret has a service-specific name but the app expects a generic env var, pass \`env_var_name\` as an alias. Example: wire \`tangent/IRIS_SLACK_BOT_TOKEN\` into repo \`iris\` with \`env_var_name: "SLACK_BOT_TOKEN"\`.
 - Bash: only Daanish can use \`bash\`, but he can use it from channels/threads as well as DMs. For investigations, run the useful diagnostic command directly, read the output, then continue with another tool/command or summarize the finding. Do not ask Daanish for a separate "yes" before every bash command.
+- Code/deploy review: when a user asks for a code review, deploy readiness check, "make sure no errors persist", "will this run on ECS/Fargate", or any review before deploy, call \`review_repo\`. Do NOT claim the repo is deploy-ready from \`read_file\` or \`inspect_repo\` alone. Summarize only the evidence returned by \`review_repo\`.
 
 *Deploy flow — read carefully:*
 - When asked to "deploy", "ship", "launch", or "help me deploy" a repo, the correct sequence is:
@@ -919,6 +938,12 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
       return { name: 'list_repos', input: {} as Record<string, never> };
     case 'inspect_repo':
       return { name: 'inspect_repo', input: { repo: String(raw['repo'] ?? '') } };
+    case 'review_repo':
+      return { name: 'review_repo', input: {
+        repo: String(raw['repo'] ?? ''),
+        branch: raw['branch'] ? String(raw['branch']) : 'main',
+        port: raw['port'] ? Number(raw['port']) : undefined,
+      }};
     case 'cve_scan':
       return { name: 'cve_scan', input: {} as Record<string, never> };
     case 'discover_config':
@@ -1351,6 +1376,7 @@ export async function diagnoseServiceFailure(
   appLogs: string,
   ngrokLogs: string,
   expectedUrl?: string,
+  ecsDetails?: string,
 ): Promise<string> {
   logger.info({ action: 'ai:diagnose_failure', repo }, 'Diagnosing service failure from logs');
   try {
@@ -1363,13 +1389,16 @@ export async function diagnoseServiceFailure(
           `The ECS Fargate service for "${repo}" has 0 running tasks after a fresh deploy.`,
           expectedUrl ? `Expected ngrok URL: ${expectedUrl}` : '',
           ``,
+          ecsDetails ? `ECS SERVICE / STOPPED TASK DETAILS (authoritative; prefer this over guessing from missing logs):` : '',
+          ecsDetails ? ecsDetails.slice(0, 3500) : '',
+          ecsDetails ? `` : '',
           `APP CONTAINER LOGS (last 50 lines):`,
           appLogs.slice(0, 2500),
           ``,
           `NGROK CONTAINER LOGS (last 50 lines):`,
           ngrokLogs.slice(0, 1500),
           ``,
-          `Identify the root cause from the logs. In 2-4 sentences: explain what went wrong, what specific error triggered it, and the exact fix. Be concrete — mention file names, env vars, port numbers, or package names if they appear.`,
+          `Identify the root cause from the ECS task details and logs. In 2-4 sentences: explain what went wrong, what specific error triggered it, and the exact fix. Be concrete — mention stoppedReason, container reason, exit code, file names, env vars, port numbers, or package names if they appear. If logs are empty but ECS stopped task details are present, use the ECS details instead of telling the user to run describe-tasks.`,
           `Use Slack mrkdwn (*bold* for key terms, \`code\` for literals). No preamble.`,
         ].filter(Boolean).join('\n'),
       }],

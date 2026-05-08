@@ -36,11 +36,16 @@ export async function cloneRepo(
 
   logger.info({ action: 'github:clone', repo, branch, destDir }, 'Cloning repo');
 
-  await execCommand(
-    'git',
-    ['clone', '--depth', '1', '--branch', branch, url, destDir],
-    { timeoutMs: GIT_TIMEOUT_MS },
-  );
+  try {
+    await execCommand(
+      'git',
+      ['clone', '--depth', '1', '--branch', branch, url, destDir],
+      { timeoutMs: GIT_TIMEOUT_MS },
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(sanitizeGitAuth(message));
+  }
 
   const { stdout: sha } = await execCommand(
     'git',
@@ -50,6 +55,10 @@ export async function cloneRepo(
 
   logger.info({ action: 'github:clone:done', repo, sha }, 'Clone complete');
   return sha;
+}
+
+function sanitizeGitAuth(message: string): string {
+  return message.replace(/https:\/\/x-access-token:[^@]+@github\.com/g, 'https://x-access-token:***@github.com');
 }
 
 /**
