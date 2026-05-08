@@ -11,24 +11,25 @@
 1. [What Tangent is](#what-tangent-is)
 2. [Top-level architecture](#top-level-architecture)
 3. [The deploy pipeline](#the-deploy-pipeline)
-4. [Repository layout](#repository-layout)
-5. [Runtime stack](#runtime-stack)
-6. [The Slack bot — message flow](#the-slack-bot--message-flow)
-7. [Tool catalogue (Claude tool-use)](#tool-catalogue-claude-tool-use)
-8. [Skills (the action layer)](#skills-the-action-layer)
-9. [Services (the integration layer)](#services-the-integration-layer)
-10. [HTTP API](#http-api)
-11. [Cron jobs](#cron-jobs)
-12. [Safety model](#safety-model)
-13. [Identity, access control & approvals](#identity-access-control--approvals)
-14. [Memory & personalisation](#memory--personalisation)
-15. [Self-healing: post-deploy auto-fix](#self-healing-post-deploy-auto-fix)
-16. [Dashboard](#dashboard)
-17. [Configuration & secrets](#configuration--secrets)
-18. [Local development](#local-development)
-19. [Production deployment (EC2 + PM2)](#production-deployment-ec2--pm2)
-20. [IAM policy](#iam-policy)
-21. [File reference](#file-reference)
+4. [Deploy review architecture](#deploy-review-architecture)
+5. [Repository layout](#repository-layout)
+6. [Runtime stack](#runtime-stack)
+7. [The Slack bot — message flow](#the-slack-bot--message-flow)
+8. [Tool catalogue (Claude tool-use)](#tool-catalogue-claude-tool-use)
+9. [Skills (the action layer)](#skills-the-action-layer)
+10. [Services (the integration layer)](#services-the-integration-layer)
+11. [HTTP API](#http-api)
+12. [Cron jobs](#cron-jobs)
+13. [Safety model](#safety-model)
+14. [Identity, access control & approvals](#identity-access-control--approvals)
+15. [Memory & personalisation](#memory--personalisation)
+16. [Self-healing: post-deploy auto-fix](#self-healing-post-deploy-auto-fix)
+17. [Dashboard](#dashboard)
+18. [Configuration & secrets](#configuration--secrets)
+19. [Local development](#local-development)
+20. [Production deployment (EC2 + PM2)](#production-deployment-ec2--pm2)
+21. [IAM policy](#iam-policy)
+22. [File reference](#file-reference)
 
 ---
 
@@ -39,7 +40,7 @@ Tangent is a TypeScript service that combines:
 - **A Slack bot** (Bolt + Socket Mode) — the primary UX. Talk to it like a person.
 - **A Fastify HTTP API** — programmatic deploy / teardown / status / list / health endpoints.
 - **A Claude-powered router** — every Slack message goes to Claude Sonnet 4.6 with a tool-use schema; Claude either replies conversationally or calls one of ~20 DevOps tools.
-- **A skill layer** — discrete units of work (`build`, `deploy`, `tunnel`, `teardown`, `monitor`, `scan`, `discover`) that talk to AWS, Docker, GitHub, ngrok.
+- **A skill layer** — discrete units of work (`review`, `build`, `deploy`, `tunnel`, `teardown`, `monitor`, `scan`, `discover`) that talk to AWS, Docker, GitHub, ngrok.
 - **Two cron jobs** — health-check every 5 min, CVE scan nightly at 02:00 UTC.
 
 The unifying idea: **the LLM is the router.** There is no separate intent-classification step. Claude looks at the conversation history, the user's identity, the available tools, and decides what to do.
@@ -65,7 +66,7 @@ flowchart TD
     MemoryContext["Memory Context\nsrc/services/memory-context.ts"] -->|"selected DB memories"| AI
     AI -->|"text reply"| SlackBot
     AI -->|"tool calls"| ToolExecutor["Tool Executor\nexecuteToolCall and chains"]
-    ToolExecutor --> Skills["Skill Layer\nbuild deploy tunnel teardown monitor scan discover"]
+    ToolExecutor --> Skills["Skill Layer\nreview build deploy tunnel teardown monitor scan discover"]
     ToolExecutor --> Services["Integration Services\nGitHub AWS Docker Postgres Env Audit Conversations"]
 
     Dashboard --> EnvService["Environment Service\nSecrets create update inject"]
@@ -165,7 +166,7 @@ This is the most important flow in Tangent. End-to-end, what happens when someon
 │ 3. Validate the repo exists in Impiricus-AI (listAllRepos)             │
 │    Look up stored ngrok URL from config/ngrok-urls.json (stable URLs)  │
 │    Post a confirmation prompt + ping <@Daanish> in #tangent-deployments│
-│    Store pending action (3-min TTL) keyed by conversation              │
+│    Store pending action (10-min TTL) keyed by conversation             │
 └─────────────────────────────────┬──────────────────────────────────────┘
                                   ▼ (Daanish replies "yes" / "ship it" / 👍)
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -178,6 +179,17 @@ This is the most important flow in Tangent. End-to-end, what happens when someon
 ┌────────────────────────────────────────────────────────────────────────┐
 │ 5. handleDeploy()  ─── posts a single rich Slack message that updates  │
 │                       in place through every stage:                    │
+│                                                                        │
+│   stage = 'reviewing'  ─► reviewRepo({ repo, branch, port })           │
+│       ├─ clone repo and inspect source                                 │
+│       ├─ deterministic deploy checks                                   │
+│       ├─ cybersecurity checks                                          │
+│       ├─ docker build                                                  │
+│       ├─ local container smoke test                                    │
+│       └─ blockers/security blockers stop before deploy confirmation    │
+│                                                                        │
+│   stage = 'analyzing'  ─► runDeployAnalysis()                          │
+│       └─ AI-assisted eligibility check backed by static evidence       │
 │                                                                        │
 │   stage = 'building'  ─►  buildSkill({ repo, branch })                 │
 │       ├─ git clone --depth 1 (Octokit token)                           │
@@ -215,6 +227,7 @@ This is the most important flow in Tangent. End-to-end, what happens when someon
 │ 6. quickHealthCheck() — fires 15s after the tunnel comes up            │
 │    • DescribeServices: any running tasks?                              │
 │    • If runningCount === 0 → service crashed on startup                │
+│         ├─ fetch ECS stopped task reasons + service events             │
 │         ├─ fetch app + ngrok logs from CloudWatch                      │
 │         ├─ Claude diagnoses root cause (diagnoseServiceFailure)        │
 │         ├─ identifyFileToFix() — single file? confident fix?           │
@@ -228,6 +241,129 @@ Three things to notice:
 1. **The ngrok URL is generated by Tangent _before_ the task starts** and persisted in `config/ngrok-urls.json`. This means the URL is stable across redeployments — the same `https://tangent-<repo>-XXXX.ngrok.app` every time, unless `freshUrl: true` is passed.
 2. **Tunnel readiness is detected by HTTP-polling the URL itself**, not by scraping CloudWatch — much faster (~2s detection vs. 30s+ log delivery delay).
 3. **`minimumHealthyPercent: 0`** in the deployment config: ECS stops the old task _before_ starting the new one. Without this, two tasks would briefly try to claim the same ngrok URL and the new one would die.
+4. **Deploys are review-gated before build/push/deploy.** `review_repo` runs deterministic deploy, security, Docker build, and local smoke checks before Tangent opens a deploy confirmation.
+
+---
+
+## Deploy review architecture
+
+The deploy review tool is Tangent's evidence gate. It exists because "I read the file and it looks good" is not enough. The review tool must produce concrete command output, static evidence, Docker build results, and smoke-test behavior before Tangent can confidently say a repo is deploy-ready.
+
+### Review Tool Flow
+
+```mermaid
+flowchart TD
+  UserRequest["User asks for review or deploy"] --> ToolChoice["Claude selects review_repo"]
+  ToolChoice --> ReviewSkill["src/skills/review.ts"]
+  ReviewSkill --> CloneRepo["Clone repo at branch"]
+  CloneRepo --> DetectFramework["Detect framework and port"]
+  DetectFramework --> StaticChecks["Static deploy checks"]
+  DetectFramework --> SecurityChecks["Cybersecurity checks"]
+  DetectFramework --> FrameworkChecks["Framework checks"]
+  StaticChecks --> DockerBuild["Docker build"]
+  SecurityChecks --> DockerBuild
+  FrameworkChecks --> DockerBuild
+  DockerBuild --> SmokeTest["Local Fargate-like smoke test"]
+  SmokeTest --> EvidenceReport["Structured evidence report"]
+  EvidenceReport --> SlackSummary["Slack summary from evidence only"]
+  SlackSummary --> DeployGate["Allow deploy confirmation or block"]
+```
+
+### Deterministic Check Layers
+
+```mermaid
+flowchart LR
+  ReviewRepo["review_repo"] --> DeployChecks["Deploy checks"]
+  ReviewRepo --> SecurityChecks["Security checks"]
+  ReviewRepo --> RuntimeChecks["Runtime checks"]
+  ReviewRepo --> NotChecked["Not checked"]
+
+  DeployChecks --> Dockerfile["Dockerfile exists"]
+  DeployChecks --> Entrypoint["CMD or ENTRYPOINT"]
+  DeployChecks --> Port["EXPOSE or detected port"]
+  DeployChecks --> Lockfile["npm ci lockfile compatibility"]
+  DeployChecks --> Hazards["localhost and env-var hazards"]
+
+  SecurityChecks --> Secrets["Secret patterns"]
+  SecurityChecks --> Audit["npm audit or pip-audit"]
+  SecurityChecks --> DockerSecurity["Dockerfile security"]
+  SecurityChecks --> CodeFootguns["eval exec shell debug CORS"]
+
+  RuntimeChecks --> Build["docker build"]
+  RuntimeChecks --> Run["docker run"]
+  RuntimeChecks --> HttpPoll["HTTP poll on mapped port"]
+  RuntimeChecks --> Logs["docker logs and exit code"]
+```
+
+The output is split into:
+
+- `Blockers`: verified deploy/runtime failures, such as missing Dockerfile, Docker build failure, container exit, or no reachable HTTP response.
+- `Security blockers`: high-confidence secrets, obvious RCE patterns, or critical deploy-relevant security failures.
+- `Security warnings`: non-blocking security risks like missing `.dockerignore`, root containers, or lower-confidence dependency findings.
+- `Warnings`: non-security issues that are worth fixing but should not block deploy.
+- `Not checked`: tools unavailable or inconclusive checks. This never becomes a pass.
+
+### Security Review Flow
+
+```mermaid
+flowchart TD
+  SecurityReview["Security review"] --> DependencyScan["Dependency vulnerability scan"]
+  SecurityReview --> SecretScan["Secret and credential scan"]
+  SecurityReview --> AppFootguns["Web app footgun scan"]
+  SecurityReview --> ContainerSecurity["Container and ECS security scan"]
+
+  DependencyScan --> NpmAudit["npm audit --omit=dev"]
+  DependencyScan --> PipAudit["pip-audit if installed"]
+  DependencyScan --> MissingScanner["record not_checked if unavailable"]
+
+  SecretScan --> TokenPatterns["AWS Slack GitHub Anthropic DB URLs private keys"]
+  TokenPatterns --> SecretSeverity["real secret is blocker placeholder is warning"]
+
+  AppFootguns --> DebugMode["debug mode"]
+  AppFootguns --> UnsafeExec["eval exec shell=True unsafe YAML"]
+  AppFootguns --> Cors["wildcard CORS with credentials"]
+
+  ContainerSecurity --> RootUser["runs as root warning"]
+  ContainerSecurity --> Dockerignore["missing .dockerignore warning"]
+  ContainerSecurity --> RemoteShell["curl pipe shell warning"]
+```
+
+### Local Fargate-Like Smoke Test
+
+```mermaid
+flowchart TD
+  BuiltImage["Built image"] --> AllocatePort["Allocate random host port"]
+  AllocatePort --> DockerRun["docker run with ECS-like env"]
+  DockerRun --> PollLoop["Poll http://127.0.0.1:hostPort"]
+  PollLoop --> Healthy["2xx to 4xx response: smoke pass"]
+  PollLoop --> Exited["Container exits"]
+  PollLoop --> Timeout["No HTTP response before timeout"]
+  Exited --> CaptureExit["Capture docker inspect exit code"]
+  Exited --> CaptureLogs["Capture docker logs"]
+  Timeout --> CaptureLogs
+  CaptureExit --> Blocker["Runtime blocker"]
+  CaptureLogs --> Blocker
+```
+
+The smoke test injects the same basic environment shape Tangent gives ECS tasks, including `PORT`, `APP_PORT`, `DB_HOST`, `DB_PORT`, and placeholders for shared app secrets. It does not replace production ECS health, but it catches the common "builds fine, dies instantly in container" class before deployment.
+
+### Deploy Gate With Override
+
+```mermaid
+flowchart TD
+  DeployRequest["deploy tool"] --> ReviewGate["reviewRepo"]
+  ReviewGate --> HasBlockers{"Any blockers or security blockers?"}
+  HasBlockers -->|"yes"| BlockDeploy["Stop before deploy confirmation"]
+  BlockDeploy --> FixPrompt["Show evidence and fix steps"]
+  FixPrompt --> Override["Daanish can override"]
+  Override --> Audit["Audit deploy analysis override"]
+  Audit --> DeployConfirmation["Deploy confirmation prompt"]
+  HasBlockers -->|"no"| OldAnalyzer["runDeployAnalysis"]
+  OldAnalyzer --> DeployConfirmation
+  DeployConfirmation --> BuildPushDeploy["build push ECS deploy"]
+```
+
+The override path is intentionally still available for Daanish, but the normal path blocks before ECR/ECS mutation when there is deterministic evidence that the repo will fail or has a serious security issue.
 
 ---
 
@@ -248,6 +384,7 @@ tangent/
 │   │   └── list.ts               GET  /list
 │   │
 │   ├── skills/                   ← The action layer (no Slack, no HTTP — pure work)
+│   │   ├── review.ts             deploy/security review → Docker build → local smoke test
 │   │   ├── build.ts              clone → verify Dockerfile → ECR login → build → push
 │   │   ├── deploy.ts             register task def → create/update service → ngrok URL registry
 │   │   ├── tunnel.ts             HTTP-poll the pre-generated URL (CloudWatch fallback)
@@ -418,6 +555,7 @@ Defined in `src/services/ai.ts` → `TOOLS`. Claude sees these and decides which
 | `list_services`     | info   | All `tangent-*` services with health                                                      |
 | `list_repos`        | info   | All repos in the Impiricus-AI org, sorted by recent activity                              |
 | `inspect_repo`      | info   | README + Dockerfile + package.json/requirements.txt + top-level files + detected EXPOSE port |
+| `review_repo`       | info   | Evidence-backed deploy/security review: static checks, audits, Docker build, smoke test   |
 | `cve_scan`          | info   | On-demand pip-audit + npm audit across scaffold-child repos                               |
 | `discover_config`   | info   | Find missing config values by querying ECR / ECS / CloudWatch                             |
 | `logs`              | info   | Recent CloudWatch logs (`app` or `ngrok` container)                                       |
@@ -452,6 +590,32 @@ Or:
 ## Skills (the action layer)
 
 Skills know nothing about Slack or HTTP. They're pure functions that take an input object, do work, and return a result object. They're called by both the Slack bot and the HTTP API.
+
+### `review.ts`
+
+```
+reviewRepo({ repo, branch, port })
+  ├─ clone repo with sanitized git errors
+  ├─ inspect Dockerfile, package files, Python files, source tree
+  ├─ run deterministic deploy checks
+  │    ├─ Dockerfile exists
+  │    ├─ CMD or ENTRYPOINT exists
+  │    ├─ EXPOSE or supplied/detected port exists
+  │    └─ npm ci has package-lock.json when required
+  ├─ run framework checks
+  │    ├─ python3 -m compileall
+  │    └─ npm ci && npm run build when package-lock.json exists
+  ├─ run security checks
+  │    ├─ npm audit / pip-audit when available
+  │    ├─ hardcoded secret patterns
+  │    ├─ debug/eval/exec/shell/YAML/CORS footguns
+  │    └─ Dockerfile hygiene
+  ├─ docker build
+  └─ docker run + HTTP smoke test
+returns { canDeploy, blockers, securityFindings, warnings, notChecked, commandsRun }
+```
+
+This skill is intentionally more deterministic than the older AI deploy analyzer. Claude can decide when to call it and can summarize its results, but the pass/fail evidence comes from source inspection and commands.
 
 ### `build.ts`
 
@@ -845,6 +1009,7 @@ If you want a one-line index of every important file:
 | `src/services/github.ts`                      | 322   | Octokit: clone, list, inspect, push, read, commits               |
 | `src/services/aws.ts`                         | 45    | AWS client singletons                                            |
 | `src/services/docker.ts`                      | 100   | ECR auth via SDK + docker config bypass, build, push             |
+| `src/skills/review.ts`                        | 784   | Evidence-backed deploy/security review and smoke test            |
 | `src/skills/build.ts`                         | 112   | clone → verify Dockerfile → ECR login → build → push             |
 | `src/skills/deploy.ts`                        | 323   | Task def + service create/update + ngrok URL registry            |
 | `src/skills/tunnel.ts`                        | 201   | HTTP poll (fast) + CloudWatch fallback                           |
