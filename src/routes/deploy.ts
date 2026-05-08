@@ -22,6 +22,8 @@ interface DeployBody {
   repo: string;
   branch?: string;
   port?: number;
+  cpu?: number;
+  memory?: number;
 }
 
 export async function deployRoutes(app: FastifyInstance): Promise<void> {
@@ -34,21 +36,23 @@ export async function deployRoutes(app: FastifyInstance): Promise<void> {
           repo: { type: 'string', minLength: 1, maxLength: 100, pattern: '^[a-z0-9._-]+$' },
           branch: { type: 'string', default: 'main' },
           port: { type: 'integer', minimum: 1, maximum: 65535, default: 8080 },
+          cpu: { type: 'integer', minimum: 256 },
+          memory: { type: 'integer', minimum: 512 },
         },
       },
     },
   }, async (req, reply) => {
     if (!await requireMutationAuth(req, reply)) return;
-    const { repo, branch = 'main', port = 8080 } = req.body;
+    const { repo, branch = 'main', port = 8080, cpu, memory } = req.body;
     let resolvedPort = port;
 
-    logger.info({ action: 'route:deploy:start', repo, branch, port }, 'Deploy request received');
+    logger.info({ action: 'route:deploy:start', repo, branch, port, cpu, memory }, 'Deploy request received');
     await recordAuditEvent({
       action: 'http:deploy',
       actor: 'http-client',
       surface: 'http',
       target: repo,
-      metadata: { branch, port },
+      metadata: { branch, port, cpu, memory },
     });
 
     // Match the Slack path's pre-deploy readiness check before spending build
@@ -101,7 +105,7 @@ export async function deployRoutes(app: FastifyInstance): Promise<void> {
     let expectedUrl: string;
 
     try {
-      const deployResult = await deploySkill({ repo, imageUri, port: resolvedPort });
+      const deployResult = await deploySkill({ repo, imageUri, port: resolvedPort, cpu, memory });
       serviceName = deployResult.serviceName;
       taskDefinition = deployResult.taskDefinition;
       deployedAt = deployResult.deployedAt;
@@ -129,6 +133,8 @@ export async function deployRoutes(app: FastifyInstance): Promise<void> {
       service: serviceName,
       taskDefinition,
       port: resolvedPort,
+      cpu,
+      memory,
     });
   });
 }

@@ -21,8 +21,19 @@ export interface ConversationTurn {
   content: string;
 }
 
+export interface DeployToolInput extends Record<string, unknown> {
+  repo: string;
+  branch: string;
+  port: number;
+  freshUrl?: boolean;
+  cpu?: number;
+  memory?: number;
+  skipAnalysis?: boolean;
+  analysisOverrideReason?: string;
+}
+
 export type AgentToolCall =
-  | { name: 'deploy';          input: { repo: string; branch: string; port: number; freshUrl?: boolean; skipAnalysis?: boolean; analysisOverrideReason?: string } }
+  | { name: 'deploy';          input: DeployToolInput }
   | { name: 'teardown';        input: { repo: string } }
   | { name: 'status';          input: { repo: string } }
   | { name: 'list_services';   input: Record<string, never> }
@@ -107,7 +118,7 @@ const TOOLS: Anthropic.Tool[] = [
     name: 'deploy',
     description:
       'Build a repo from GitHub, push the Docker image to ECR, and deploy it as an ECS Fargate service with an ngrok tunnel URL. ' +
-      'Use when the engineer asks to deploy, launch, ship, push, or run a service.',
+      'Use when the engineer asks to deploy, launch, ship, push, run a service, generate a new ngrok URL, or change the ECS task CPU/memory size for a service.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -115,6 +126,8 @@ const TOOLS: Anthropic.Tool[] = [
         branch:   { type: 'string', description: 'Git branch to build from. Default: "main"' },
         port:     { type: 'number', description: 'Port the app listens on inside the container. Default: 8080' },
         freshUrl: { type: 'boolean', description: 'Set true to generate a brand-new ngrok URL instead of reusing the existing one. Only use when the user explicitly asks for a new URL.' },
+        cpu:      { type: 'number', description: 'Optional ECS Fargate task CPU units for this deploy, e.g. 512, 1024, 2048, 4096. Use when the user asks to change/increase/decrease CPU or task size.' },
+        memory:   { type: 'number', description: 'Optional ECS Fargate task memory in MiB for this deploy, e.g. 1024, 2048, 4096, 8192. Use when the user asks to change/increase/decrease memory or task size.' },
       },
       required: ['repo'],
     },
@@ -633,6 +646,7 @@ Your primary superpower is DevOps: deploy services, monitor them, tear them down
   3. Wait for the user to confirm ("yes", "go ahead", etc.) — THEN call the \`deploy\` tool.
 - NEVER chain directly from an info tool (inspect_repo, list_secrets, etc.) straight into \`deploy\`. Always reply with text first so the user knows what you're about to do and can correct you.
 - After a deploy completes, post the live URL and tag the requester.
+- If the user asks to change a service's task size, CPU, or memory, use the \`deploy\` tool with \`cpu\` and/or \`memory\`. Example: "set analytics-app to 2048 CPU and 8192 memory" means call deploy for repo \`analytics-app\` with \`cpu: 2048\` and \`memory: 8192\`.
 
 *Port rules — critical, read carefully:*
 - The port MUST match what the app actually listens on inside the container. Getting this wrong causes "Cannot GET /" or connection refused.
@@ -916,6 +930,12 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
   return Math.min(max, Math.max(min, n));
 }
 
+function optionalNumber(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCall | null {
   switch (name) {
     case 'deploy':
@@ -926,6 +946,8 @@ function buildToolCall(name: string, raw: Record<string, unknown>): AgentToolCal
           branch:   String(raw['branch'] ?? 'main'),
           port:     Number(raw['port'] ?? 8080),
           freshUrl: raw['freshUrl'] === true,
+          cpu:      optionalNumber(raw['cpu']),
+          memory:   optionalNumber(raw['memory']),
         },
       };
     case 'teardown':

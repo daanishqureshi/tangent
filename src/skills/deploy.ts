@@ -4,7 +4,7 @@
  * Register an ECS task definition and create/update the ECS service.
  * Each task has two containers: the app and an ngrok sidecar.
  *
- * Input:  { repo, imageUri, port?, env? }
+ * Input:  { repo, imageUri, port?, env?, cpu?, memory? }
  * Output: { serviceName, taskDefinition }
  */
 
@@ -45,6 +45,8 @@ export interface DeployInput {
   port?: number;
   env?: Record<string, string>;
   freshUrl?: boolean; // force a new ngrok URL even if one already exists
+  cpu?: number;       // optional per-deploy Fargate task CPU units
+  memory?: number;    // optional per-deploy Fargate task memory in MiB
 }
 
 export interface DeployOutput {
@@ -77,6 +79,7 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
   const port = input.port ?? defaultAppPort;
   const serviceName = `${SERVICE_PREFIX}${repo}`;
   const taskFamily = `${TASK_FAMILY_PREFIX}${repo}`;
+  const taskSize = resolveTaskSize(input.cpu, input.memory, taskCpu, taskMemory);
 
   // ─── Resolve ngrok URL for this deploy ───────────────────────────────────
   // Reuse the URL from a previous deploy if one exists, so the endpoint stays
@@ -191,8 +194,8 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
     containerDefinitions: [appContainer, ngrokContainer],
     networkMode: 'awsvpc',
     requiresCompatibilities: ['FARGATE'],
-    cpu: taskCpu,
-    memory: taskMemory,
+    cpu: taskSize.cpu,
+    memory: taskSize.memory,
     executionRoleArn: ecsExecutionRoleArn,
     taskRoleArn: ecsTaskRoleArn,
   });
@@ -255,12 +258,55 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
   }
 
   const deployedAt = Date.now();
-  logger.info({ action: 'deploy:done', serviceName, taskDefArn, deployedAt, ngrokUrl }, 'Deploy complete');
+  logger.info({ action: 'deploy:done', serviceName, taskDefArn, deployedAt, ngrokUrl, taskSize }, 'Deploy complete');
 
   return { serviceName, taskDefinition: taskDefArn, deployedAt, ngrokUrl };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function resolveTaskSize(
+  cpuOverride: number | undefined,
+  memoryOverride: number | undefined,
+  defaultCpu: string,
+  defaultMemory: string,
+): { cpu: string; memory: string } {
+  const cpu = cpuOverride ?? Number(defaultCpu);
+  const memory = memoryOverride ?? Number(defaultMemory);
+
+  if (!Number.isInteger(cpu) || !Number.isInteger(memory)) {
+    throw new Error(`Invalid ECS task size: cpu and memory must be integers. Got cpu=${cpu}, memory=${memory}.`);
+  }
+
+  if (!isValidFargateTaskSize(cpu, memory)) {
+    throw new Error(
+      `Invalid ECS Fargate task size: cpu=${cpu}, memory=${memory}. ` +
+      'Use a valid Fargate pair, for example cpu=1024 memory=2048-8192, or cpu=2048 memory=4096-16384.',
+    );
+  }
+
+  return { cpu: String(cpu), memory: String(memory) };
+}
+
+function isValidFargateTaskSize(cpu: number, memory: number): boolean {
+  const memoryOptionsByCpu = new Map<number, number[]>([
+    [256, [512, 1024, 2048]],
+    [512, range(1024, 4096, 1024)],
+    [1024, range(2048, 8192, 1024)],
+    [2048, range(4096, 16384, 1024)],
+    [4096, range(8192, 30720, 1024)],
+    [8192, range(16384, 61440, 4096)],
+    [16384, range(32768, 122880, 8192)],
+  ]);
+
+  return memoryOptionsByCpu.get(cpu)?.includes(memory) ?? false;
+}
+
+function range(min: number, max: number, step: number): number[] {
+  const values: number[] = [];
+  for (let value = min; value <= max; value += step) values.push(value);
+  return values;
+}
 
 interface ServiceNetworkConfig {
   awsvpcConfiguration: {

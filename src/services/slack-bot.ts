@@ -20,7 +20,7 @@ import { App, LogLevel } from '@slack/bolt';
 import type { WebClient } from '@slack/web-api';
 import type { KnownBlock } from '@slack/types';
 import { config, allowUser } from '../config.js';
-import { processMessage, continueAfterTool, classifyConsent, diagnoseServiceFailure, identifyFileToFix, generateCodeFix, type ConversationTurn, type AgentToolCall, type ToolChainStep } from './ai.js';
+import { processMessage, continueAfterTool, classifyConsent, diagnoseServiceFailure, identifyFileToFix, generateCodeFix, type ConversationTurn, type AgentToolCall, type DeployToolInput, type ToolChainStep } from './ai.js';
 import { buildSkill, DockerfileNotFoundError, DockerBuildError } from '../skills/build.js';
 import { runDeployAnalysis } from '../skills/analyze.js';
 import { deploySkill } from '../skills/deploy.js';
@@ -672,7 +672,7 @@ async function _routeInner(
 }
 
 async function promptForDeployCall(call: AgentToolCall, ctx: Ctx, convKey: string): Promise<void> {
-  let { repo, branch, port, freshUrl } = call.input as { repo: string; branch: string; port: number; freshUrl?: boolean };
+  let { repo, branch, port, freshUrl, cpu, memory } = call.input as DeployToolInput;
 
   // ── Validate repo exists in GitHub before showing confirmation ─────────
   let allRepos: { name: string }[];
@@ -729,11 +729,13 @@ async function promptForDeployCall(call: AgentToolCall, ctx: Ctx, convKey: strin
     `• Requested by: ${requester}`,
     `• Branch: \`${branch}\``,
     `• Port: ${port}`,
+    cpu ? `• CPU: ${cpu}` : undefined,
+    memory ? `• Memory: ${memory} MiB` : undefined,
     urlNote,
     `• Cluster: \`tangent\` (us-east-1)`,
     '',
     `${requester} — reply *yes* to approve or *no* to cancel.`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 
   _setPending(convKey, call, prompt, undefined, ctx.userId);
   await post(ctx.client, ctx.channel, ctx.threadTs, prompt);
@@ -790,7 +792,7 @@ async function executeToolCall(
     switch (call.name) {
       case 'deploy':
         _appendTurn(convKey, { role: 'assistant', content: `Deploying \`${(call.input as { repo: string }).repo}\`` });
-        await handleDeploy(ctx, call.input as { repo: string; branch: string; port: number; freshUrl?: boolean; skipAnalysis?: boolean; analysisOverrideReason?: string }, convKey);
+        await handleDeploy(ctx, call.input as DeployToolInput, convKey);
         break;
       case 'teardown':
         _appendTurn(convKey, { role: 'assistant', content: `Stopping \`${(call.input as { repo: string }).repo}\`` });
@@ -1867,7 +1869,7 @@ async function fetchStoppedTaskDetails(repo: string): Promise<string> {
 
 async function handleDeploy(
   { channel, threadTs, userId, client }: Ctx,
-  { repo, branch, port, freshUrl, skipAnalysis, analysisOverrideReason }: { repo: string; branch: string; port: number; freshUrl?: boolean; skipAnalysis?: boolean; analysisOverrideReason?: string },
+  { repo, branch, port, freshUrl, cpu, memory, skipAnalysis, analysisOverrideReason }: DeployToolInput,
   convKey: string,
 ): Promise<void> {
   const actor = userId ? `<@${userId}>` : 'someone';
@@ -1884,7 +1886,7 @@ async function handleDeploy(
       const report = formatReviewResult(review);
       _setPendingDeployOverride(convKey, {
         name: 'deploy',
-        input: { repo, branch, port, freshUrl },
+        input: { repo, branch, port, freshUrl, cpu, memory },
       }, [
         ...review.blockers.map((finding) => finding.title),
         ...review.securityFindings.filter((finding) => finding.severity === 'blocker').map((finding) => finding.title),
@@ -1951,7 +1953,7 @@ async function handleDeploy(
 
     _setPendingDeployOverride(convKey, {
       name: 'deploy',
-      input: { repo, branch, port, freshUrl },
+      input: { repo, branch, port, freshUrl, cpu, memory },
     }, analysis.blockers.map((b) => b.issue), userId);
     const msg = `❌ *\`${repo}\` is not ready to deploy* — ${analysis.blockers.length} blocker(s) found:\n\n${blockerLines}${promptBlock}\n\n_Fix the issues above, then ask me to deploy again. If this is a false positive, <@${APPROVER_ID}> can say “override deploy” or “continue anyway” in this thread._`;
     await update(client, channel, ts, msg);
@@ -1969,7 +1971,7 @@ async function handleDeploy(
 
   await update(client, channel, ts,
     `✓ Analysis passed.${warningText}\n🔨 Building \`${repo}\` from \`${branch}\`...`,
-    statusBlocks({ repo, branch, port: resolvedPort, actor, stage: 'building' }),
+    statusBlocks({ repo, branch, port: resolvedPort, cpu, memory, actor, stage: 'building' }),
   );
 
   // Shadow-replace port with the detected value for the rest of the deploy
@@ -1992,14 +1994,14 @@ async function handleDeploy(
 
   await update(client, channel, ts,
     `🚀 Build done. Deploying to ECS...`,
-    statusBlocks({ repo, branch, port, actor, stage: 'deploying', sha }),
+    statusBlocks({ repo, branch, port, cpu, memory, actor, stage: 'deploying', sha }),
   );
 
   // ── Deploy ─────────────────────────────────────────────────────────────────
   let deployedAt: number;
   let ngrokUrl: string;
   try {
-    ({ deployedAt, ngrokUrl } = await deploySkill({ repo, imageUri, port, freshUrl }));
+    ({ deployedAt, ngrokUrl } = await deploySkill({ repo, imageUri, port, freshUrl, cpu, memory }));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await update(client, channel, ts, `❌ ECS deploy failed`, errorBlocks('❌ ECS deploy failed', repo, msg));
@@ -2009,7 +2011,7 @@ async function handleDeploy(
 
   await update(client, channel, ts,
     `⏳ ECS service updated. Waiting for ngrok tunnel...`,
-    statusBlocks({ repo, branch, port, actor, stage: 'tunneling', sha }),
+    statusBlocks({ repo, branch, port, cpu, memory, actor, stage: 'tunneling', sha }),
   );
 
   // ── Tunnel ─────────────────────────────────────────────────────────────────
@@ -2028,7 +2030,7 @@ async function handleDeploy(
   logger.info({ action: 'slack_bot:deploy:done', repo, url }, 'Deploy complete');
   await update(client, channel, ts,
     `✅ \`${repo}\` is live at ${url}`,
-    statusBlocks({ repo, branch, port, actor, stage: 'done', sha, url }),
+    statusBlocks({ repo, branch, port, cpu, memory, actor, stage: 'done', sha, url }),
   );
   _appendTurn(convKey, { role: 'assistant', content: `✅ \`${repo}\` is live at ${url}` });
 
@@ -2086,7 +2088,7 @@ async function handleTeardown(
 
 async function fetchStatus(repo: string): Promise<string> {
   const { SERVICE_PREFIX } = await import('../utils/constants.js');
-  const { DescribeServicesCommand } = await import('@aws-sdk/client-ecs');
+  const { DescribeServicesCommand, DescribeTaskDefinitionCommand } = await import('@aws-sdk/client-ecs');
   const { ecsClient } = await import('./aws.js');
 
   const serviceName = `${SERVICE_PREFIX}${repo}`;
@@ -2102,11 +2104,24 @@ async function fetchStatus(repo: string): Promise<string> {
     const running = svc.runningCount ?? 0;
     const desired = svc.desiredCount ?? 0;
     const healthy = running >= desired && desired > 0;
+    let taskSize = 'unknown';
+    if (svc.taskDefinition) {
+      try {
+        const taskDefResult = await ecsClient().send(new DescribeTaskDefinitionCommand({
+          taskDefinition: svc.taskDefinition,
+        }));
+        const taskDef = taskDefResult.taskDefinition;
+        taskSize = `cpu=${taskDef?.cpu ?? 'unknown'}, memory=${taskDef?.memory ?? 'unknown'} MiB`;
+      } catch {
+        taskSize = 'unavailable';
+      }
+    }
 
     const baseSummary = [
       `Service: ${serviceName}`,
       `ECS status: ${status}`,
       `Tasks: ${running}/${desired} running`,
+      `Task size: ${taskSize}`,
       `Health: ${healthy ? 'healthy' : 'DEGRADED — service is not running its desired task count'}`,
       `Cluster: ${config().ecsClusterName}`,
     ].join('\n');
@@ -2964,9 +2979,9 @@ type DeployStage = 'building' | 'deploying' | 'tunneling' | 'done';
 
 function statusBlocks(opts: {
   repo: string; branch: string; port: number; actor: string;
-  stage: DeployStage; sha?: string; url?: string;
+  stage: DeployStage; sha?: string; url?: string; cpu?: number; memory?: number;
 }): KnownBlock[] {
-  const { repo, branch, port, actor, stage, sha, url } = opts;
+  const { repo, branch, port, actor, stage, sha, url, cpu, memory } = opts;
 
   const headline: Record<DeployStage, string> = {
     building:  `🔨 Building \`${repo}\` from \`${branch}\`...`,
@@ -2981,6 +2996,8 @@ function statusBlocks(opts: {
     { type: 'mrkdwn', text: `*Port*\n${port}` },
     { type: 'mrkdwn', text: `*By*\n${actor}` },
   ];
+  if (cpu) fields.push({ type: 'mrkdwn', text: `*CPU*\n${cpu}` });
+  if (memory) fields.push({ type: 'mrkdwn', text: `*Memory*\n${memory} MiB` });
   if (sha) fields.push({ type: 'mrkdwn', text: `*Image*\n\`${repo}-${sha}\`` });
   if (url) fields.push({ type: 'mrkdwn', text: `*URL*\n<${url}|${url}>` });
 
