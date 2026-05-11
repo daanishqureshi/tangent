@@ -6,6 +6,8 @@
  */
 
 export const APPROVER_ID = 'U07EU7KSG3U';
+export const BEN_BARONE_ID = 'U09UZ7MJJJK';
+export const BASH_ALLOWED_USER_IDS = new Set([APPROVER_ID, BEN_BARONE_ID]);
 
 export type ToolRisk = 'read' | 'write' | 'admin' | 'host';
 
@@ -28,7 +30,7 @@ export const ACTION_POLICIES = {
   provision_app_database: { risk: 'admin', requiresConfirmation: false, requiredUserId: APPROVER_ID, chainable: true, dashboardAllowed: false, audit: 'sensitive' },
   db_create_user:  { risk: 'admin', requiresConfirmation: false, requiredUserId: APPROVER_ID, chainable: true, dashboardAllowed: false, audit: 'sensitive' },
   db_drop_user:    { risk: 'admin', requiresConfirmation: false, requiredUserId: APPROVER_ID, chainable: true, dashboardAllowed: false, audit: 'sensitive' },
-  bash:            { risk: 'host',  requiresConfirmation: true,  requiredUserId: APPROVER_ID, dmOnly: true, chainable: false, dashboardAllowed: false, audit: 'sensitive' },
+  bash:            { risk: 'host',  requiresConfirmation: true,  chainable: false, dashboardAllowed: false, audit: 'sensitive' },
   edit_self:       { risk: 'admin', requiresConfirmation: false, requiredUserId: APPROVER_ID, dmOnly: true, chainable: false, dashboardAllowed: false, audit: 'sensitive' },
   push_self:       { risk: 'admin', requiresConfirmation: false, requiredUserId: APPROVER_ID, dmOnly: true, chainable: false, dashboardAllowed: false, audit: 'sensitive' },
 } satisfies Record<string, ActionPolicy>;

@@ -589,8 +589,8 @@ const TOOLS: Anthropic.Tool[] = [
     name: 'bash',
     description:
       'Execute a bash command on the Tangent EC2 — the same host Tangent runs on. ' +
-      '*ONLY Daanish (U07EU7KSG3U) can call this, but he can use it in DMs, channels, or threads.* ' +
-      'When Daanish asks you to investigate host/runtime state, call bash directly; its output is fed back into the agent loop so you can continue reasoning and run the next diagnostic command when useful. ' +
+      '*Only approved Tangent operators can call this: Daanish (U07EU7KSG3U) and Ben Barone (U09UZ7MJJJK). They can use it in DMs, channels, or threads.* ' +
+      'When an approved operator asks you to investigate host/runtime state, call bash directly; its output is fed back into the agent loop so you can continue reasoning and run the next diagnostic command when useful. ' +
       'Use this for ops tasks that previously required SSH: editing /etc/postgresql/15/main/pg_hba.conf, reloading services (e.g. `sudo -u postgres psql -c "SELECT pg_reload_conf();"`), inspecting disk usage, tailing /var/log files, running pg_dump, checking systemd unit status, etc. ' +
       'Tangent runs as user `ubuntu` which has passwordless `sudo` on this AMI — `sudo` works in any command. ' +
       'Hard caps: 60s timeout (default; max 600s), 8KB stdout/stderr cap each, no interactive input, no shell pipes are special — the command is passed to `bash -c`. ' +
@@ -602,7 +602,7 @@ const TOOLS: Anthropic.Tool[] = [
       type: 'object' as const,
       properties: {
         command: { type: 'string', description: 'The bash command to execute (passed to `bash -c`). Can include pipes, redirects, sudo, etc.' },
-        reason:  { type: 'string', description: 'A short human-readable explanation of what this command does and why you are running it. Shown verbatim in the confirmation prompt to Daanish.' },
+        reason:  { type: 'string', description: 'A short human-readable explanation of what this command does and why you are running it.' },
         timeout_seconds: { type: 'number', description: 'Optional override for the 60s default timeout. Max 600.' },
       },
       required: ['command', 'reason'],
@@ -656,7 +656,7 @@ Your primary superpower is DevOps: deploy services, monitor them, tear them down
 - edit_file: use for ALL small, targeted edits to existing files (renaming a variable, fixing an env var name, swapping a port, updating a constant, fixing a typo, replacing a couple of lines). The substitution runs server-side — file content never passes through your context, so nothing can be lost. Workflow: optionally read_file to see what's there, then edit_file with a unique \`find\` snippet and the new \`replace\` text. Always prefer this over read_file + push_file for edits.
 - Recovering deleted/overwritten files: Use list_commits with the file path to find the last good commit SHA, then call restore_file with that SHA. NEVER use read_file + push_file for recovery — content gets lost through the LLM context window. restore_file does it atomically server-side.
 - Secret injection: use \`inject_secret\`, not \`bash\`, for ECS task-definition secret wiring. If a secret has a service-specific name but the app expects a generic env var, pass \`env_var_name\` as an alias. Example: wire \`tangent/IRIS_SLACK_BOT_TOKEN\` into repo \`iris\` with \`env_var_name: "SLACK_BOT_TOKEN"\`.
-- Bash: only Daanish can use \`bash\`, but he can use it from channels/threads as well as DMs. For investigations, run the useful diagnostic command directly, read the output, then continue with another tool/command or summarize the finding. Do not ask Daanish for a separate "yes" before every bash command.
+- Bash: only approved Tangent operators can use \`bash\`: Daanish (U07EU7KSG3U) and Ben Barone (U09UZ7MJJJK). They can use it from channels/threads as well as DMs. For investigations, run the useful diagnostic command directly, read the output, then continue with another tool/command or summarize the finding. Do not ask for a separate "yes" before every bash command.
 - Code/deploy review: when a user asks for a code review, deploy readiness check, "make sure no errors persist", "will this run on ECS/Fargate", or any review before deploy, call \`review_repo\`. Do NOT claim the repo is deploy-ready from \`read_file\` or \`inspect_repo\` alone. Summarize only the evidence returned by \`review_repo\`.
 
 *Deploy flow — read carefully:*
@@ -745,12 +745,12 @@ Once you have the ID, you know exactly who it is. Greet them by name. Never ask 
 - *Dropping users (Daanish-only):* \`db_drop_user\` is destructive and irreversible. Always confirm before invoking.
 - *Refusal pattern:* if a non-Daanish user asks to create or drop a DB user, refuse politely and tell them to ping Daanish.
 
-*Bash on the host (Daanish-only — high-risk tool, read carefully):*
+*Bash on the host (approved operators only — high-risk tool, read carefully):*
 - You CAN execute bash commands directly on the Tangent EC2. You run on this same host, so SSH is unnecessary for ops tasks like editing pg_hba.conf, reloading services, tailing /var/log, running pg_dump, checking systemd, etc.
 - HARD GATES — the \`bash\` tool will refuse to run unless this is true:
-  1. The caller is Daanish (U07EU7KSG3U). For anyone else, refuse politely and tell them to ping Daanish.
-- Daanish can run bash from DMs, channels, or threads. Do not ask him to move to DM.
-- Bash is no longer confirmation-gated for Daanish. If he asks you to investigate, run the useful command directly, then use the output to continue debugging or summarize the finding.
+  1. The caller is Daanish (U07EU7KSG3U) or Ben Barone (U09UZ7MJJJK). For anyone else, refuse politely and tell them to ping Daanish.
+- Approved operators can run bash from DMs, channels, or threads. Do not ask them to move to DM.
+- Bash is no longer confirmation-gated for approved operators. If they ask you to investigate, run the useful command directly, then use the output to continue debugging or summarize the finding.
 - WHEN to use bash: edit \`/etc/postgresql/*/main/pg_hba.conf\`, run \`sudo -u postgres psql -c "SELECT pg_reload_conf();"\`, \`sudo systemctl status\`, \`df -h\`, \`tail -n 200 /var/log/...\`, \`pg_dump\`, \`sudo apt-get install ...\` (after explicit Daanish confirmation), \`pm2 logs\`, etc.
 - WHEN NOT to use bash:
   - Don't use it to modify Tangent's own source — use \`edit_self\` / \`push_self\` / \`read_self\` so the change goes through git history.

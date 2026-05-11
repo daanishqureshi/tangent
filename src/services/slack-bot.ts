@@ -34,7 +34,7 @@ import { listSecrets, putSecret, injectSecretIntoService, configureServiceEnviro
 import { recordAuditEvent } from './audit.js';
 import { getRecentMessagesByConversation, recordConversationMessageLater, recordToolEvent, recordToolEventLater, type ConversationMessageRow, type ConversationSource } from './conversations.js';
 import { addAllowedUserToDbLater, getServiceUrl, rememberPersonInDb } from './state.js';
-import { APPROVER_ID } from './policy.js';
+import { APPROVER_ID, BASH_ALLOWED_USER_IDS } from './policy.js';
 import { logger } from '../utils/logger.js';
 
 // ─── App singleton ────────────────────────────────────────────────────────────
@@ -686,10 +686,10 @@ async function _routeInner(
   }
 
   if (call.name === 'bash') {
-    // Bash is Daanish-only, but it can run from any Slack surface so ops
-    // debugging can happen in the incident thread that has the context.
-    if (ctx.userId !== APPROVER_ID) {
-      const msg = '🔒 Only Daanish can run shell commands on the Tangent host.';
+    // Bash is restricted to trusted operators, but it can run from any Slack
+    // surface so ops debugging can happen in the incident thread.
+    if (!ctx.userId || !BASH_ALLOWED_USER_IDS.has(ctx.userId)) {
+      const msg = '🔒 Only approved Tangent operators can run shell commands on the Tangent host.';
       await post(ctx.client, ctx.channel, ctx.threadTs, msg);
       _appendTurn(convKey, { role: 'assistant', content: msg });
       return;
@@ -1039,7 +1039,7 @@ async function _chainIfNeeded(
       return;
     }
 
-    // Bash is Daanish-only but no longer confirmation-gated, so it can be
+    // Bash is trusted-operator-only but no longer confirmation-gated, so it can be
     // part of an investigation loop. It keeps the original user request in
     // chain context instead of a bare "yes".
     if (next.call.name === 'bash') {
@@ -1740,6 +1740,8 @@ async function quickHealthCheck(
 
   // Check if the service still has running tasks
   let running: number;
+  let desired: number;
+  let pending: number;
   try {
     const { SERVICE_PREFIX } = await import('../utils/constants.js');
     const { DescribeServicesCommand } = await import('@aws-sdk/client-ecs');
@@ -1748,7 +1750,10 @@ async function quickHealthCheck(
     const result = await ecsClient().send(
       new DescribeServicesCommand({ cluster: config().ecsClusterName, services: [serviceName] }),
     );
-    running = result.services?.[0]?.runningCount ?? 1;
+    const service = result.services?.[0];
+    running = service?.runningCount ?? 1;
+    desired = service?.desiredCount ?? 0;
+    pending = service?.pendingCount ?? 0;
   } catch {
     // ECS API blip — skip silently, don't false-alarm
     logger.warn({ action: 'health_check:api_error', repo }, 'ECS check failed, skipping health check');
@@ -1760,12 +1765,29 @@ async function quickHealthCheck(
     return;
   }
 
+  const ecsDetails = await fetchStoppedTaskDetails(repo);
+  if (isSchedulerStoppedWithoutAppCrash(ecsDetails)) {
+    const msg = [
+      `⚠️ *<@${APPROVER_ID}> — \`${repo}\` has no running ECS tasks after deploy*`,
+      '',
+      `This does *not* look like an application crash. The recent stopped task was marked \`ServiceSchedulerInitiated\`, which usually means ECS stopped an old task during deployment or scaling. Current service count is desired/running/pending: ${desired}/${running}/${pending}.`,
+      '',
+      '*Current ECS evidence:*',
+      `\`\`\`${tailForSlack(ecsDetails, 2800)}\`\`\``,
+      '',
+      `_Next step: check the latest ECS service event for why no replacement task is running. If this service needs Postgres on ${config().pgHostInternalIp}, verify the service is using the Tangent/Postgres VPC subnets and security group, then force a new deployment after the scheduler/network issue clears._`,
+    ].join('\n');
+    await post(client, channel, threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    logger.info({ action: 'health_check:scheduler_issue', repo }, 'Service has 0 running tasks but stopped task was scheduler-initiated');
+    return;
+  }
+
   // ── Service crashed ────────────────────────────────────────────────────────
   logger.info({ action: 'health_check:crashed', repo }, 'Service has 0 running tasks — fetching logs for diagnosis');
 
   let appLogs = '';
   let ngrokLogs = '';
-  const ecsDetails = await fetchStoppedTaskDetails(repo);
   try { appLogs   = await fetchLogs(repo, 'app');   } catch { appLogs   = '(app logs unavailable)'; }
   try { ngrokLogs = await fetchLogs(repo, 'ngrok'); } catch { ngrokLogs = '(ngrok logs unavailable)'; }
 
@@ -1840,6 +1862,13 @@ async function quickHealthCheck(
   }
 
   logger.info({ action: 'health_check:alerted', repo, autoFixed }, 'Health check alert posted');
+}
+
+function isSchedulerStoppedWithoutAppCrash(ecsDetails: string): boolean {
+  const hasSchedulerStop = /stopCode:\s*ServiceSchedulerInitiated/i.test(ecsDetails)
+    || /stoppedReason:\s*Scaling activity initiated by/i.test(ecsDetails);
+  const hasContainerFailure = /\bexit=(?!0\b)\d+|CannotPullContainerError|ResourceInitializationError|Essential container in task exited|OutOfMemoryError|CannotStartContainerError/i.test(ecsDetails);
+  return hasSchedulerStop && !hasContainerFailure;
 }
 
 async function fetchStoppedTaskDetails(repo: string): Promise<string> {
@@ -2884,8 +2913,8 @@ async function handleBash(
   // Belt-and-suspenders gates. The route()-level gates SHOULD have caught
   // this already, but the cost of an extra check vs. accidentally executing
   // an unauthorised shell command is asymmetric — keep them.
-  if (ctx.userId !== APPROVER_ID) {
-    const msg = '🔒 bash tool refused — caller is not Daanish.';
+  if (!ctx.userId || !BASH_ALLOWED_USER_IDS.has(ctx.userId)) {
+    const msg = '🔒 bash tool refused — caller is not an approved Tangent operator.';
     await post(ctx.client, ctx.channel, ctx.threadTs, msg);
     _appendTurn(convKey, { role: 'assistant', content: msg });
     return msg;

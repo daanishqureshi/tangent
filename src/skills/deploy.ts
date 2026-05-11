@@ -308,7 +308,7 @@ function range(min: number, max: number, step: number): number[] {
   return values;
 }
 
-interface ServiceNetworkConfig {
+export interface ServiceNetworkConfig {
   awsvpcConfiguration: {
     subnets: string[];
     securityGroups: string[];
@@ -316,7 +316,7 @@ interface ServiceNetworkConfig {
   };
 }
 
-async function resolveServiceNetworkConfig(): Promise<ServiceNetworkConfig> {
+export async function resolveServiceNetworkConfig(): Promise<ServiceNetworkConfig> {
   const cfg = config();
   const configured: ServiceNetworkConfig = {
     awsvpcConfiguration: {

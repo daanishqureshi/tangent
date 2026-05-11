@@ -21,6 +21,7 @@ import {
 import { config } from '../config.js';
 import { ecsClient, smClient } from './aws.js';
 import { recordAuditEvent } from './audit.js';
+import { resolveServiceNetworkConfig } from '../skills/deploy.js';
 import { SERVICE_PREFIX, TASK_FAMILY_PREFIX } from '../utils/constants.js';
 import { assertAllowedCluster } from '../utils/safety.js';
 import { logger } from '../utils/logger.js';
@@ -210,11 +211,13 @@ export async function injectSecretIntoService(
   if (!taskDefinitionArn) throw new Error('Task definition re-registration returned no ARN');
 
   try {
+    const networkConfig = await resolveServiceNetworkConfig();
     await ecsClient().send(new UpdateServiceCommand({
       cluster: ecsClusterName,
       service: `${SERVICE_PREFIX}${input.repo}`,
       taskDefinition: taskDefinitionArn,
       forceNewDeployment: true,
+      networkConfiguration: networkConfig,
     }));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -337,11 +340,13 @@ export async function configureServiceEnvironment(
   if (!taskDefinitionArn) throw new Error('Task definition re-registration returned no ARN');
 
   try {
+    const networkConfig = await resolveServiceNetworkConfig();
     await ecsClient().send(new UpdateServiceCommand({
       cluster: ecsClusterName,
       service: `${SERVICE_PREFIX}${input.repo}`,
       taskDefinition: taskDefinitionArn,
       forceNewDeployment: true,
+      networkConfiguration: networkConfig,
     }));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
