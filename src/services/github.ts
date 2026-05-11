@@ -36,15 +36,33 @@ export async function cloneRepo(
 
   logger.info({ action: 'github:clone', repo, branch, destDir }, 'Cloning repo');
 
-  try {
-    await execCommand(
-      'git',
-      ['clone', '--depth', '1', '--branch', branch, url, destDir],
-      { timeoutMs: GIT_TIMEOUT_MS },
-    );
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new Error(sanitizeGitAuth(message));
+  let lastError = '';
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await execCommand(
+        'git',
+        ['clone', '--depth', '1', '--branch', branch, url, destDir],
+        { timeoutMs: GIT_TIMEOUT_MS },
+      );
+      lastError = '';
+      break;
+    } catch (err) {
+      const message = sanitizeGitAuth(err instanceof Error ? err.message : String(err));
+      lastError = message;
+      if (!isTransientGitCloneError(message) || attempt === 3) {
+        throw new Error(message);
+      }
+      logger.warn(
+        { action: 'github:clone:retry', repo, branch, attempt, message },
+        'Transient git clone failure; retrying',
+      );
+      await sleep(1000 * attempt);
+      await removeClone(destDir);
+    }
+  }
+
+  if (lastError) {
+    throw new Error(lastError);
   }
 
   const { stdout: sha } = await execCommand(
@@ -59,6 +77,14 @@ export async function cloneRepo(
 
 function sanitizeGitAuth(message: string): string {
   return message.replace(/https:\/\/x-access-token:[^@]+@github\.com/g, 'https://x-access-token:***@github.com');
+}
+
+function isTransientGitCloneError(message: string): boolean {
+  return /internal server error|requested url returned error: 5\d\d|http\/2 stream|connection reset|connection timed out|could not resolve host|operation timed out/i.test(message);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
