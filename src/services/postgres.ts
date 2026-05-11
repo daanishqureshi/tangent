@@ -314,12 +314,14 @@ export async function createDbUser(opts: {
     }
     await client.query(`CREATE ROLE "${opts.username}" WITH LOGIN PASSWORD '${password}'`);
 
-    // Grant the new role TO tangent_admin so tangent_admin is a member of it.
+    const adminRole = await currentAdminRole(client);
+
+    // Grant the new role TO the connected admin role so it is a member of it.
     // This is required for later REASSIGN OWNED / DROP OWNED operations:
     // those commands need the executing role to be a member of BOTH the
     // source and target roles.  Without this grant, dropDbUser() fails with
     // "permission denied to reassign objects".
-    await client.query(`GRANT "${opts.username}" TO tangent_admin`);
+    await client.query(`GRANT "${opts.username}" TO ${quoteIdent(adminRole)}`);
 
     let databaseName: string | null = null;
     if (opts.createDatabase) {
@@ -370,6 +372,7 @@ export async function provisionAppDatabase(opts: {
   const pool = adminPool();
   const client = await pool.connect();
   try {
+    const adminRole = await currentAdminRole(client);
     const roleExists = await client.query<{ exists: boolean }>(
       `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1) AS exists`,
       [username],
@@ -380,7 +383,7 @@ export async function provisionAppDatabase(opts: {
     } else {
       await client.query(`ALTER ROLE "${username}" WITH LOGIN PASSWORD '${password}'`);
     }
-    await client.query(`GRANT "${username}" TO tangent_admin`);
+    await client.query(`GRANT "${username}" TO ${quoteIdent(adminRole)}`);
 
     const databaseExists = await client.query<{ exists: boolean }>(
       `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1) AS exists`,
@@ -417,17 +420,18 @@ export async function dropDbUser(username: string, dropDatabase: boolean): Promi
   const pool = adminPool();
   const client = await pool.connect();
   try {
+    const adminRole = await currentAdminRole(client);
     if (dropDatabase) {
       await client.query(`DROP DATABASE IF EXISTS "${username}"`);
     }
 
-    // REASSIGN OWNED / DROP OWNED require the executing role (tangent_admin)
+    // REASSIGN OWNED / DROP OWNED require the executing admin role
     // to be a member of the target role.  Defensive grant — idempotent, and
     // covers roles that were created before createDbUser started doing this
-    // automatically.  tangent_admin's CREATEROLE privilege lets it grant any
+    // automatically.  The admin role's CREATEROLE privilege lets it grant any
     // role to itself.
     try {
-      await client.query(`GRANT "${username}" TO tangent_admin`);
+      await client.query(`GRANT "${username}" TO ${quoteIdent(adminRole)}`);
     } catch {
       // If the grant fails (e.g. role doesn't exist), let the subsequent
       // commands surface the real error.
@@ -435,7 +439,7 @@ export async function dropDbUser(username: string, dropDatabase: boolean): Promi
 
     // REASSIGN OWNED so we don't leak orphaned privileges on objects the
     // role created in shared databases.
-    await client.query(`REASSIGN OWNED BY "${username}" TO tangent_admin`);
+    await client.query(`REASSIGN OWNED BY "${username}" TO ${quoteIdent(adminRole)}`);
     await client.query(`DROP OWNED BY "${username}" CASCADE`);
     await client.query(`DROP ROLE IF EXISTS "${username}"`);
   } finally {
@@ -444,6 +448,17 @@ export async function dropDbUser(username: string, dropDatabase: boolean): Promi
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+async function currentAdminRole(client: pg.PoolClient): Promise<string> {
+  const result = await client.query<{ current_user: string }>('SELECT current_user');
+  const role = result.rows[0]?.current_user;
+  if (!role) throw new Error('Could not determine current Postgres admin role');
+  return role;
+}
+
+function quoteIdent(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
 
 function generatePassword(length: number): string {
   const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
