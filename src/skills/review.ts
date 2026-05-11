@@ -55,6 +55,7 @@ interface ReviewOptions {
   repo: string;
   branch?: string;
   port?: number;
+  quick?: boolean;
 }
 
 interface CommandFailure extends Error {
@@ -102,9 +103,18 @@ export async function reviewRepo(input: ReviewOptions): Promise<ReviewResult> {
 
     await runStaticDeployChecks(cloneDir, files, dockerfile, packageJson, findings, detectedPort);
     await runSecurityChecks(cloneDir, files, dockerfile, packageJson, requirementsTxt, findings, commandsRun);
-    await runFrameworkChecks(cloneDir, files, packageJson, requirementsTxt, findings, commandsRun);
+    if (input.quick) {
+      findings.push({
+        category: 'deploy',
+        severity: 'not_checked',
+        title: 'Runtime build checks skipped in deploy gate',
+        detail: 'The deploy gate ran static and security checks only. The normal deploy build remains the authoritative Docker build check.',
+      });
+    } else {
+      await runFrameworkChecks(cloneDir, files, packageJson, requirementsTxt, findings, commandsRun);
+    }
 
-    if (dockerfile) {
+    if (dockerfile && !input.quick) {
       imageTag = `tangent-review-${sanitizeTag(repo)}-${sha}-${Date.now()}`;
       const build = await runCommand(
         'docker',

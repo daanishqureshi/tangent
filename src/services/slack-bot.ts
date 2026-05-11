@@ -1956,7 +1956,7 @@ async function handleDeploy(
 
   if (!skipAnalysis) {
     await update(client, channel, ts, `🔎 Running deploy/security review for \`${repo}\`...`);
-    const review = await reviewRepo({ repo, branch, port });
+    const review = await reviewRepo({ repo, branch, port, quick: true });
     if (!review.canDeploy) {
       const report = formatReviewResult(review);
       _setPendingDeployOverride(convKey, {
