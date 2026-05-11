@@ -2730,18 +2730,8 @@ async function handleProvisionAppDatabase(
   try {
     const db = await provisionAppDatabase({
       repo: input.repo,
-      username: input.username,
       databaseName: input.database_name,
     });
-    const secretName = `${input.repo}/DB_PASSWORD`;
-    const savedSecret = await putSecret(
-      {
-        name: secretName,
-        value: db.password,
-        description: `Postgres password for ${input.repo} service role ${db.username}`,
-      },
-      { actor: ctx.userId ?? 'unknown', surface: 'slack' },
-    );
     const configured = await configureServiceEnvironment(
       {
         repo: input.repo,
@@ -2750,9 +2740,11 @@ async function handleProvisionAppDatabase(
           DB_HOST: config().pgHostInternalIp,
           DB_PORT: '5432',
           DB_NAME: db.databaseName,
-          DB_USER: db.username,
         },
-        secrets: [{ secretName: savedSecret.name, envVarName: 'DB_PASSWORD' }],
+        secrets: [
+          { secretName: 'DB_USER', envVarName: 'DB_USER' },
+          { secretName: 'DB_PASSWORD', envVarName: 'DB_PASSWORD' },
+        ],
       },
       { actor: ctx.userId ?? 'unknown', surface: 'slack' },
     );
@@ -2764,10 +2756,10 @@ async function handleProvisionAppDatabase(
       target: input.repo,
       metadata: {
         databaseName: db.databaseName,
-        username: db.username,
-        roleCreated: db.roleCreated,
+        ownerRole: db.ownerRole,
         databaseCreated: db.databaseCreated,
-        secretName: savedSecret.name,
+        dbUserSecret: 'tangent/DB_USER',
+        dbPasswordSecret: 'tangent/DB_PASSWORD',
         taskDefinitionArn: configured.taskDefinitionArn,
       },
     });
@@ -2775,9 +2767,9 @@ async function handleProvisionAppDatabase(
     const msg = [
       `✅ *Postgres storage provisioned for \`${input.repo}\`*`,
       `Database: \`${db.databaseName}\` ${db.databaseCreated ? '(created)' : '(already existed)'}`,
-      `Role: \`${db.username}\` ${db.roleCreated ? '(created)' : '(password rotated)'}`,
-      `Secret: \`${savedSecret.name}\` → \`DB_PASSWORD\``,
-      `Injected env: \`STORAGE=${storageEnv}\`, \`DB_HOST=${config().pgHostInternalIp}\`, \`DB_PORT=5432\`, \`DB_NAME=${db.databaseName}\`, \`DB_USER=${db.username}\``,
+      `Owner/admin role: \`${db.ownerRole}\``,
+      `Secrets: \`tangent/DB_USER\` → \`DB_USER\`, \`tangent/DB_PASSWORD\` → \`DB_PASSWORD\``,
+      `Injected env: \`STORAGE=${storageEnv}\`, \`DB_HOST=${config().pgHostInternalIp}\`, \`DB_PORT=5432\`, \`DB_NAME=${db.databaseName}\``,
       configured.changed
         ? `ECS task definition updated: \`${configured.taskDefinitionArn}\``
         : `ECS task definition already had the requested DB env wiring.`,
@@ -2785,7 +2777,7 @@ async function handleProvisionAppDatabase(
     await update(ctx.client, ctx.channel, ts, msg);
     _appendTurn(convKey, { role: 'assistant', content: msg });
 
-    return `Provisioned Postgres storage for ${input.repo}: database=${db.databaseName}, user=${db.username}, DB_PASSWORD secret=${savedSecret.name}.`;
+    return `Provisioned Postgres storage for ${input.repo}: database=${db.databaseName}, DB_USER secret=tangent/DB_USER, DB_PASSWORD secret=tangent/DB_PASSWORD.`;
   } catch (err) {
     const msg = `❌ Failed to provision Postgres storage for \`${input.repo}\`: ${err instanceof Error ? err.message : String(err)}`;
     await update(ctx.client, ctx.channel, ts, msg);

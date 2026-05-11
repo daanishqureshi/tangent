@@ -536,15 +536,15 @@ const TOOLS: Anthropic.Tool[] = [
     description:
       'Create or update a dedicated Postgres database for a deployed app and wire the ECS service to use it. ONLY Daanish (U07EU7KSG3U) can call this. ' +
       'Use when a service needs persistent Postgres storage, needs STORAGE=postgres, needs DB_NAME/DB_USER/DB_PASSWORD configured, or when someone asks to "wire repo X to Postgres". ' +
-      'By default, Tangent derives a safe database name and role name from the repo (for example chatbot-config -> chatbot_config), so do NOT ask the user for DB_NAME unless they explicitly want a custom name. ' +
-      'This creates/rotates the app DB role password, stores it in Secrets Manager, injects STORAGE, DB_NAME, DB_USER, and secret-backed DB_PASSWORD into the ECS task definition, and force-deploys the service. ' +
-      'DB_HOST and DB_PORT are already auto-injected by the normal deploy path.',
+      'By default, Tangent derives a safe database name from the repo (for example chatbot-config -> chatbot_config), so do NOT ask the user for DB_NAME unless they explicitly want a custom name. ' +
+      'This creates the app database if needed, injects STORAGE/DB_HOST/DB_PORT/DB_NAME as plain env vars, injects DB_USER from tangent/DB_USER, injects DB_PASSWORD from tangent/DB_PASSWORD, and force-deploys the service. ' +
+      'Do not create service-specific DB users/passwords by default; Impiricus currently uses the admin DB credentials from Secrets Manager for deployed app DB access.',
     input_schema: {
       type: 'object' as const,
       properties: {
         repo: { type: 'string', description: 'Repository/service name to configure, e.g. "chatbot-config".' },
         database_name: { type: 'string', description: 'Optional custom Postgres database name. Usually omit and let Tangent derive this from repo.' },
-        username: { type: 'string', description: 'Optional custom Postgres role name. Usually omit and let Tangent derive this from repo.' },
+        username: { type: 'string', description: 'Deprecated/ignored. DB_USER comes from Secrets Manager secret tangent/DB_USER.' },
         storage_env: { type: 'string', description: 'Optional value for STORAGE. Default: "postgres".' },
       },
       required: ['repo'],
@@ -743,7 +743,7 @@ Once you have the ID, you know exactly who it is. Greet them by name. Never ask 
 - *Querying data:* \`db_query\` runs as a read-only role with a 5s timeout and 50-row cap. Open to any authorised user. Only SELECT/WITH/EXPLAIN/SHOW/VALUES/TABLE statements are allowed; anything destructive is rejected.
 - *Cross-referencing code with DB:* combine \`read_file\` + \`db_schema\` / \`db_query\` to answer questions like "does the service use the columns it expects?" or "is this migration safe given the current data?". Use this proactively when debugging.
 - *Creating users (Daanish-only):* \`db_create_user\` generates a random 32-char password and posts it directly in the Slack thread. Set \`create_database: true\` for services that need an isolated database.
-- *Provisioning app databases (Daanish-only):* use \`provision_app_database\` when a deployed service needs persistent Postgres storage. It derives DB_NAME and DB_USER from the repo by default, stores DB_PASSWORD in Secrets Manager, injects STORAGE/DB_NAME/DB_USER/DB_PASSWORD into the ECS task definition, and redeploys. Do not ask the user for DB_NAME unless they explicitly need a custom one.
+- *Provisioning app databases (Daanish-only):* use \`provision_app_database\` when a deployed service needs persistent Postgres storage. It derives DB_NAME from the repo by default, creates the database if needed, injects STORAGE/DB_HOST/DB_PORT/DB_NAME as plain env vars, injects DB_USER from \`tangent/DB_USER\`, injects DB_PASSWORD from \`tangent/DB_PASSWORD\`, and redeploys. Do not create service-specific DB users/passwords by default.
 - *Dropping users (Daanish-only):* \`db_drop_user\` is destructive and irreversible. Always confirm before invoking.
 - *Refusal pattern:* if a non-Daanish user asks to create or drop a DB user, refuse politely and tell them to ping Daanish.
 
