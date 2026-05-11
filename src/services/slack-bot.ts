@@ -33,7 +33,7 @@ import { listAllRepos, inspectRepo, pushFile, readRepoFile, listCommits, editFil
 import { listSecrets, putSecret, injectSecretIntoService, configureServiceEnvironment } from './environment.js';
 import { recordAuditEvent } from './audit.js';
 import { getRecentMessagesByConversation, recordConversationMessageLater, recordToolEvent, recordToolEventLater, type ConversationMessageRow, type ConversationSource } from './conversations.js';
-import { addAllowedUserToDbLater, getServiceUrl, rememberPersonInDb } from './state.js';
+import { addAllowedUserToDb, getServiceUrl, isAllowedUserInDb, rememberPersonInDb } from './state.js';
 import { APPROVER_ID, BASH_ALLOWED_USER_IDS } from './policy.js';
 import { logger } from '../utils/logger.js';
 
@@ -209,6 +209,16 @@ function _convKey(channel: string, threadTs: string, source: 'mention' | 'dm'): 
 
 function _conversationSource(source: 'mention' | 'dm'): ConversationSource {
   return source === 'dm' ? 'slack_dm' : 'slack_thread';
+}
+
+async function isAllowedSlackUser(userId: string | undefined): Promise<boolean> {
+  if (!userId) return false;
+  const dbAllowed = await isAllowedUserInDb(userId);
+  if (dbAllowed !== null) return dbAllowed;
+
+  // Fallback for local dev or DB outage: use env/json-hydrated bootstrap cache.
+  const { allowedSlackUserIds } = config();
+  return allowedSlackUserIds.size === 0 || allowedSlackUserIds.has(userId);
 }
 
 async function _isRecentlyActiveDbConversation(convKey: string): Promise<boolean> {
@@ -486,9 +496,10 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
     metadata: { slackSource: source },
   });
 
-  // Access control
-  const { allowedSlackUserIds } = config();
-  if (allowedSlackUserIds.size > 0 && (!resolvedUserId || !allowedSlackUserIds.has(resolvedUserId))) {
+  // Access control. Postgres is the runtime source of truth when configured;
+  // config.allowedSlackUserIds is only a bootstrap/fallback cache.
+  const allowed = await isAllowedSlackUser(resolvedUserId);
+  if (!allowed) {
     logger.warn({ action: 'slack_bot:unauthorized', userId: resolvedUserId }, 'Unauthorized user');
     await post(ctx.client, ctx.channel, ctx.threadTs, "Sorry, you're not authorized to use Tangent.");
     return;
@@ -507,17 +518,12 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
     }
     const newUserId = addUserMatch[1]!;
     const result = allowUser(newUserId);
-    addAllowedUserToDbLater(newUserId, undefined, 'slack_fast_path');
+    await addAllowedUserToDb(newUserId, undefined, 'slack_fast_path');
     let msg: string;
-    if (result.alreadyAllowed && !result.persisted && !result.error) {
+    if (result.alreadyAllowed) {
       msg = `ℹ️ <@${newUserId}> is already on the allowed list.`;
-    } else if (result.persisted) {
-      const shaNote = result.commitSha ? ` (commit \`${result.commitSha}\`)` : '';
-      msg = `✅ <@${newUserId}> has been added — pushed to \`main\`${shaNote}.`;
-    } else if (result.error) {
-      msg = `⚠️ <@${newUserId}> granted in memory, but GitHub push failed: _${result.error}_`;
     } else {
-      msg = `✅ <@${newUserId}> has been added to the allowed list.`;
+      msg = `✅ <@${newUserId}> has been added to the allowed users table.`;
     }
     await post(ctx.client, ctx.channel, ctx.threadTs, msg);
     return;
@@ -855,17 +861,12 @@ async function executeToolCall(
         break;
       }
       const result = allowUser(user_id);
-      addAllowedUserToDbLater(user_id, display_name, 'slack_tool');
+      await addAllowedUserToDb(user_id, display_name, 'slack_tool');
       let msg: string;
-      if (result.alreadyAllowed && !result.persisted && !result.error) {
+      if (result.alreadyAllowed) {
         msg = `ℹ️ <@${user_id}> (${display_name}) is already on the allowed list — no change needed.`;
-      } else if (result.persisted) {
-        const shaNote = result.commitSha ? ` (commit \`${result.commitSha}\`)` : '';
-        msg = `✅ Done — <@${user_id}> (${display_name}) now has access to Tangent. Persisted to \`config/allowed_users.json\` and pushed to \`main\`${shaNote}.`;
-      } else if (result.error) {
-        msg = `⚠️ <@${user_id}> (${display_name}) granted access in memory, but I could NOT push the change to GitHub: _${result.error}_\nIt will be lost on next restart unless the push is redone manually.`;
       } else {
-        msg = `✅ Done — <@${user_id}> (${display_name}) now has access to Tangent (already on disk).`;
+        msg = `✅ Done — <@${user_id}> (${display_name}) now has access to Tangent. Persisted to \`tangent_app.allowed_users\`.`;
       }
       await post(ctx.client, ctx.channel, ctx.threadTs, msg);
       _appendTurn(convKey, { role: 'assistant', content: msg });

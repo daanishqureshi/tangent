@@ -26,6 +26,23 @@ export async function loadAllowedUsersFromDb(): Promise<string[]> {
   }
 }
 
+export async function isAllowedUserInDb(userId: string): Promise<boolean | null> {
+  if (!pgConfigured()) return null;
+  try {
+    const r = await queryPool().query<{ exists: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM ${appTable('allowed_users')}
+         WHERE slack_user_id = $1
+       ) AS exists`,
+      [userId],
+    );
+    return r.rows[0]?.exists ?? false;
+  } catch (err) {
+    logger.warn({ action: 'state:allowed_user_check_failed', userId, err }, 'Failed to check allowed user in DB');
+    return null;
+  }
+}
+
 export async function addAllowedUserToDb(userId: string, displayName?: string, source = 'runtime'): Promise<void> {
   if (!pgConfigured()) return;
   await adminPool().query(
@@ -37,6 +54,16 @@ export async function addAllowedUserToDb(userId: string, displayName?: string, s
        updated_at = now()`,
     [userId, displayName ?? null, source],
   );
+}
+
+export async function seedAllowedUsersToDb(userIds: Iterable<string>, source = 'bootstrap'): Promise<number> {
+  if (!pgConfigured()) return 0;
+  let count = 0;
+  for (const userId of userIds) {
+    await addAllowedUserToDb(userId, undefined, source);
+    count++;
+  }
+  return count;
 }
 
 export function addAllowedUserToDbLater(userId: string, displayName?: string, source = 'runtime'): void {
@@ -103,17 +130,19 @@ export async function rememberPersonInDb(input: { userId: string; name: string; 
 export async function hydrateRuntimeStateFromDb(): Promise<void> {
   if (!pgConfigured()) return;
   const cfg = config();
+  const bootstrapAllowedUsers = [...cfg.allowedSlackUserIds];
+  const seededAllowedUsers = await seedAllowedUsersToDb(bootstrapAllowedUsers, 'bootstrap');
 
   const [allowedUsers, peopleNotes] = await Promise.all([
     loadAllowedUsersFromDb(),
     loadPeopleNotesFromDb(),
   ]);
 
-  for (const userId of allowedUsers) cfg.allowedSlackUserIds.add(userId);
+  cfg.allowedSlackUserIds = new Set(allowedUsers);
   if (peopleNotes.length > 0) cfg.peopleNotes = mergePeopleNotes(cfg.peopleNotes, peopleNotes);
 
   logger.info(
-    { action: 'state:hydrate_from_db', allowedUsers: allowedUsers.length, peopleNotes: peopleNotes.length },
+    { action: 'state:hydrate_from_db', allowedUsers: allowedUsers.length, seededAllowedUsers, peopleNotes: peopleNotes.length },
     'Hydrated runtime state from DB',
   );
 }

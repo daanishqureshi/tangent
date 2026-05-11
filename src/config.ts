@@ -12,8 +12,7 @@ import {
   SecretsManagerClient,
   GetSecretValueCommand,
 } from '@aws-sdk/client-secrets-manager';
-import { readFileSync, writeFileSync } from 'fs';
-import { execSync } from 'child_process';
+import { readFileSync } from 'fs';
 import { resolve } from 'path';
 import { logger } from './utils/logger.js';
 
@@ -118,67 +117,19 @@ export function config(): Config {
 export interface AllowUserResult {
   /** True iff the user was already in memory (idempotent re-add). */
   alreadyAllowed: boolean;
-  /** True iff a commit was created and pushed to GitHub. */
-  persisted: boolean;
-  /** Short SHA of the new commit, when persisted. */
-  commitSha?: string;
-  /** Error message if the disk write or git push failed. In-memory grant still succeeded. */
-  error?: string;
 }
 
 /**
- * Dynamically add a Slack user ID to the allowed list at runtime, and persist to GitHub.
- * Returns a structured result so callers can surface *what actually happened* (in-memory
- * grant vs. persisted commit vs. push failure) back to the user instead of a blind
- * "done". Without this, Tangent reports success even when the git push silently fails.
+ * Dynamically add a Slack user ID to the in-memory runtime allow cache.
+ * Postgres is the runtime source of truth; this cache is only a fast local
+ * mirror/fallback for cases where Postgres is unavailable.
  */
 export function allowUser(userId: string): AllowUserResult {
   const cfg = config();
   const alreadyAllowed = cfg.allowedSlackUserIds.has(userId);
   cfg.allowedSlackUserIds.add(userId);
-
-  let existing: string[] = [];
-  try {
-    existing = (JSON.parse(readFileSync(ALLOWED_USERS_FILE, 'utf8')) as { allowedUserIds: string[] }).allowedUserIds;
-  } catch { /* file missing or malformed — start fresh */ }
-
-  if (existing.includes(userId)) {
-    // Nothing to persist — already on disk from a prior run.
-    return { alreadyAllowed, persisted: false };
-  }
-
-  try {
-    existing.push(userId);
-    writeFileSync(ALLOWED_USERS_FILE, JSON.stringify({ allowedUserIds: existing }, null, 2));
-
-    // Push to whatever branch is currently checked out — the EC2 host was
-    // historically on `master` while local dev uses `main`, and hardcoding
-    // `main` here meant the push silently no-op'd on EC2, leaving runtime
-    // commits stranded locally until the next manual `git pull` diverged.
-    const currentBranch = execSync(`git -C "${PROJECT_ROOT}" rev-parse --abbrev-ref HEAD`, { stdio: ['pipe', 'pipe', 'pipe'] })
-      .toString().trim();
-
-    execSync(
-      `git -C "${PROJECT_ROOT}" add config/allowed_users.json && ` +
-      `git -C "${PROJECT_ROOT}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
-      `commit -m "chore: allow user ${userId}" && ` +
-      `git -C "${PROJECT_ROOT}" push origin ${currentBranch}`,
-      { stdio: 'pipe' },
-    );
-
-    let commitSha: string | undefined;
-    try {
-      commitSha = execSync(`git -C "${PROJECT_ROOT}" rev-parse --short HEAD`, { stdio: ['pipe', 'pipe', 'pipe'] })
-        .toString().trim();
-    } catch { /* best-effort */ }
-
-    logger.info({ action: 'config:allow_user:persisted', userId, commitSha }, 'Allowed user persisted to GitHub');
-    return { alreadyAllowed, persisted: true, commitSha };
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    logger.warn({ action: 'config:allow_user:persist_failed', userId, err: errMsg }, 'Failed to persist allowed user to GitHub');
-    return { alreadyAllowed, persisted: false, error: errMsg };
-  }
+  logger.info({ action: 'config:allow_user:runtime_cache', userId, alreadyAllowed }, 'Allowed user added to runtime cache');
+  return { alreadyAllowed };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
