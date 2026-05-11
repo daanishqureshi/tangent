@@ -597,7 +597,8 @@ const TOOLS: Anthropic.Tool[] = [
       'You MUST include a short `reason` field explaining what the command is supposed to accomplish so the confirmation prompt is human-readable. ' +
       'Do NOT use this to modify Tangent\'s OWN source code (use edit_self / push_self / read_self). ' +
       'Do NOT use this to bypass other gated tools (e.g. running `aws ecs ...` to deploy when there is a deploy tool, using AWS CLI to inject ECS secrets when there is an inject_secret tool, or `psql` to drop a role when there is a db_drop_user tool). Each existing tool is the canonical path for its action. ' +
-      'Do NOT use this for tasks that don\'t require host access (file reads in repos → use read_file; secret listing → use list_secrets).',
+      'Do NOT use this for tasks that don\'t require host access (file reads in repos → use read_file; secret listing → use list_secrets). ' +
+      'Never use bash to git clone GitHub repos; private repo clones require Tangent\'s structured GitHub helpers. Use review_repo, inspect_repo, read_file, or edit_file instead.',
     input_schema: {
       type: 'object' as const,
       properties: {
@@ -657,6 +658,7 @@ Your primary superpower is DevOps: deploy services, monitor them, tear them down
 - Recovering deleted/overwritten files: Use list_commits with the file path to find the last good commit SHA, then call restore_file with that SHA. NEVER use read_file + push_file for recovery — content gets lost through the LLM context window. restore_file does it atomically server-side.
 - Secret injection: use \`inject_secret\`, not \`bash\`, for ECS task-definition secret wiring. If a secret has a service-specific name but the app expects a generic env var, pass \`env_var_name\` as an alias. Example: wire \`tangent/IRIS_SLACK_BOT_TOKEN\` into repo \`iris\` with \`env_var_name: "SLACK_BOT_TOKEN"\`.
 - Bash: only approved Tangent operators can use \`bash\`: Daanish (U07EU7KSG3U) and Ben Barone (U09UZ7MJJJK). They can use it from channels/threads as well as DMs. For investigations, run the useful diagnostic command directly, read the output, then continue with another tool/command or summarize the finding. Do not ask for a separate "yes" before every bash command.
+- Never use \`bash\` to \`git clone\` GitHub repos. Private repos need the GitHub token injected by structured tools. For repo security scans/reviews, use \`review_repo\`; for source reads/edits, use \`read_file\`, \`edit_file\`, or \`push_file\`.
 - Code/deploy review: when a user asks for a code review, deploy readiness check, "make sure no errors persist", "will this run on ECS/Fargate", or any review before deploy, call \`review_repo\`. Do NOT claim the repo is deploy-ready from \`read_file\` or \`inspect_repo\` alone. Summarize only the evidence returned by \`review_repo\`.
 
 *Deploy flow — read carefully:*
@@ -755,7 +757,7 @@ Once you have the ID, you know exactly who it is. Greet them by name. Never ask 
 - WHEN NOT to use bash:
   - Don't use it to modify Tangent's own source — use \`edit_self\` / \`push_self\` / \`read_self\` so the change goes through git history.
   - Don't use it to bypass other tools — if there's a structured tool for the action (\`deploy\`, \`db_drop_user\`, \`inject_secret\`, etc.), use that. The structured tool has gates and audit trails this tool doesn't.
-  - Don't use it to inspect repo files — use \`read_file\` so the LLM can read the file content cleanly.
+  - Don't use it to inspect, clone, or scan GitHub repos — use \`review_repo\`, \`inspect_repo\`, \`read_file\`, or \`edit_file\` so private repo auth is handled correctly.
   - Don't use it for routine reads when a dedicated tool exists (status, list_services, list_secrets, db_schema, db_query).
 - Always include a short \`reason\` explaining what the command does — that text is shown to Daanish verbatim on the confirmation prompt, so make it informative.
 - Tangent runs as user \`ubuntu\`, which has passwordless \`sudo\`. \`sudo\` works for any command. Be deliberate.

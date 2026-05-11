@@ -2924,6 +2924,13 @@ async function handleBash(
   const timeoutMs = Math.min(Math.max(input.timeout_seconds ?? 60, 1), 600) * 1000;
   const OUTPUT_CAP = 8 * 1024;
 
+  if (isUnauthenticatedGithubClone(command)) {
+    const msg = '❌ Refusing unauthenticated GitHub clone in bash. Private repos require Tangent\'s structured GitHub tools; use `review_repo`, `inspect_repo`, `read_file`, or `edit_file` instead.';
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  }
+
   const started = Date.now();
   const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Running: \`${command.length > 80 ? command.slice(0, 77) + '...' : command}\``);
 
@@ -3059,6 +3066,11 @@ async function handleBash(
     `stdout:\n${result.stdout || '(empty)'}`,
     `stderr:\n${result.stderr || '(empty)'}`,
   ].join('\n');
+}
+
+function isUnauthenticatedGithubClone(command: string): boolean {
+  return /\bgit\s+clone\b[\s\S]*https:\/\/github\.com\//i.test(command)
+    && !/x-access-token:|GITHUB_TOKEN|githubToken/i.test(command);
 }
 
 async function handleRememberPerson(
