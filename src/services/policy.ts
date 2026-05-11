@@ -25,6 +25,7 @@ export const ACTION_POLICIES = {
   put_secret:      { risk: 'write', requiresConfirmation: false, chainable: true,  dashboardAllowed: true,  audit: 'sensitive' },
   inject_secret:   { risk: 'write', requiresConfirmation: false, chainable: true,  dashboardAllowed: true,  audit: 'sensitive' },
   db_query:        { risk: 'read',  requiresConfirmation: false, chainable: true,  dashboardAllowed: false, audit: 'standard' },
+  provision_app_database: { risk: 'admin', requiresConfirmation: false, requiredUserId: APPROVER_ID, chainable: true, dashboardAllowed: false, audit: 'sensitive' },
   db_create_user:  { risk: 'admin', requiresConfirmation: false, requiredUserId: APPROVER_ID, chainable: true, dashboardAllowed: false, audit: 'sensitive' },
   db_drop_user:    { risk: 'admin', requiresConfirmation: false, requiredUserId: APPROVER_ID, chainable: true, dashboardAllowed: false, audit: 'sensitive' },
   bash:            { risk: 'host',  requiresConfirmation: true,  requiredUserId: APPROVER_ID, dmOnly: true, chainable: false, dashboardAllowed: false, audit: 'sensitive' },

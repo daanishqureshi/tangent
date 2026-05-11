@@ -263,6 +263,16 @@ export interface CreateDbUserResult {
   connectionString: string;
 }
 
+export interface ProvisionAppDatabaseResult {
+  repo: string;
+  username: string;
+  databaseName: string;
+  password: string;
+  connectionString: string;
+  roleCreated: boolean;
+  databaseCreated: boolean;
+}
+
 /**
  * Create a new Postgres role with a random password.  Optionally also
  * creates a database owned by the new role and grants it ALL on that DB.
@@ -338,6 +348,68 @@ export async function createDbUser(opts: {
   }
 }
 
+export async function provisionAppDatabase(opts: {
+  repo: string;
+  username?: string;
+  databaseName?: string;
+}): Promise<ProvisionAppDatabaseResult> {
+  const username = opts.username?.trim() || serviceDbIdentifier(opts.repo);
+  const databaseName = opts.databaseName?.trim() || username;
+  if (!validateRoleName(username)) {
+    throw new Error(`Invalid role name "${username}" — must be lowercase alphanumeric + underscore, 2-63 chars, starting with a letter.`);
+  }
+  if (!validateRoleName(databaseName)) {
+    throw new Error(`Invalid database name "${databaseName}" — must be lowercase alphanumeric + underscore, 2-63 chars, starting with a letter.`);
+  }
+
+  const password = generatePassword(32);
+  if (!/^[A-Za-z0-9]+$/.test(password)) {
+    throw new Error('Generated password contains characters outside [A-Za-z0-9] — refusing to inline into DDL');
+  }
+
+  const pool = adminPool();
+  const client = await pool.connect();
+  try {
+    const roleExists = await client.query<{ exists: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1) AS exists`,
+      [username],
+    );
+    const roleCreated = !roleExists.rows[0]?.exists;
+    if (roleCreated) {
+      await client.query(`CREATE ROLE "${username}" WITH LOGIN PASSWORD '${password}'`);
+    } else {
+      await client.query(`ALTER ROLE "${username}" WITH LOGIN PASSWORD '${password}'`);
+    }
+    await client.query(`GRANT "${username}" TO tangent_admin`);
+
+    const databaseExists = await client.query<{ exists: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1) AS exists`,
+      [databaseName],
+    );
+    const databaseCreated = !databaseExists.rows[0]?.exists;
+    if (databaseCreated) {
+      await client.query(`CREATE DATABASE "${databaseName}" OWNER "${username}"`);
+    } else {
+      await client.query(`ALTER DATABASE "${databaseName}" OWNER TO "${username}"`);
+    }
+    await client.query(`GRANT CONNECT ON DATABASE "${databaseName}" TO tangent_query`);
+
+    const cfg = config();
+    const connectionString = `postgresql://${username}:${password}@${cfg.pgHostInternalIp}:5432/${databaseName}`;
+    return {
+      repo: opts.repo,
+      username,
+      databaseName,
+      password,
+      connectionString,
+      roleCreated,
+      databaseCreated,
+    };
+  } finally {
+    client.release();
+  }
+}
+
 export async function dropDbUser(username: string, dropDatabase: boolean): Promise<void> {
   if (!validateRoleName(username)) {
     throw new Error(`Invalid role name "${username}"`);
@@ -383,4 +455,14 @@ function generatePassword(length: number): string {
     out += ALPHABET[buf[i]! % ALPHABET.length];
   }
   return out;
+}
+
+function serviceDbIdentifier(repo: string): string {
+  const normalized = repo
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 55);
+  const withPrefix = /^[a-z]/.test(normalized) ? normalized : `app_${normalized}`;
+  return withPrefix.length >= 2 ? withPrefix : 'app_db';
 }

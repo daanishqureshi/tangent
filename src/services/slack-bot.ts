@@ -30,9 +30,9 @@ import { reviewRepo, formatReviewResult } from '../skills/review.js';
 import { scanSkill } from '../skills/scan.js';
 import { discoverSkill } from '../skills/discover.js';
 import { listAllRepos, inspectRepo, pushFile, readRepoFile, listCommits, editFile } from './github.js';
-import { listSecrets, putSecret, injectSecretIntoService } from './environment.js';
+import { listSecrets, putSecret, injectSecretIntoService, configureServiceEnvironment } from './environment.js';
 import { recordAuditEvent } from './audit.js';
-import { recordConversationMessageLater, recordToolEvent, recordToolEventLater, type ConversationSource } from './conversations.js';
+import { getRecentMessagesByConversation, recordConversationMessageLater, recordToolEvent, recordToolEventLater, type ConversationMessageRow, type ConversationSource } from './conversations.js';
 import { addAllowedUserToDbLater, getServiceUrl, rememberPersonInDb } from './state.js';
 import { APPROVER_ID } from './policy.js';
 import { logger } from '../utils/logger.js';
@@ -168,8 +168,8 @@ function isStopIntent(text: string): boolean {
 // Key strategy:
 //   • Channel threads  → read from Slack conversations.replies on every message
 //                        (bounded to that thread, survives process restarts)
-//   • DMs              → in-memory store keyed by channel ID
-//                        (Slack DM history is unbounded and risks pulling in stale data)
+//   • DMs              → in-memory store keyed by channel ID, hydrated from
+//                        Postgres after restarts.
 //
 // Thread participation tracking:
 //   • _activeThreads   → Set of "channel:threadTs" keys where Tangent has posted.
@@ -211,6 +211,13 @@ function _conversationSource(source: 'mention' | 'dm'): ConversationSource {
   return source === 'dm' ? 'slack_dm' : 'slack_thread';
 }
 
+async function _isRecentlyActiveDbConversation(convKey: string): Promise<boolean> {
+  const rows = await getRecentMessagesByConversation(convKey, 1).catch(() => []);
+  const last = rows.at(-1);
+  if (!last) return false;
+  return Date.now() - last.created_at.getTime() <= CONV_TTL_MS;
+}
+
 function _getHistory(key: string): ConversationTurn[] {
   const entry = _conversations.get(key);
   if (!entry) return [];
@@ -234,6 +241,27 @@ function _appendTurn(key: string, turn: ConversationTurn): void {
   }
 }
 
+function rowsToConversationTurns(rows: ConversationMessageRow[], currentMessageTs?: string): ConversationTurn[] {
+  const turns = rows
+    .filter((row) => row.slack_message_ts !== currentMessageTs)
+    .filter((row) => row.role === 'user' || row.role === 'assistant')
+    .map((row): ConversationTurn => {
+      if (row.role === 'assistant') return { role: 'assistant', content: row.text };
+      const prefix = row.slack_user_id
+        ? `[Slack User: <@${row.slack_user_id}> | ID: ${row.slack_user_id}]\n`
+        : '';
+      return { role: 'user', content: prefix + row.text };
+    });
+
+  while (turns.length > 0 && turns[0]?.role === 'assistant') turns.shift();
+  return turns.slice(-CONV_MAX_TURNS);
+}
+
+async function hydrateHistoryFromDb(convKey: string, currentMessageTs?: string): Promise<ConversationTurn[]> {
+  const rows = await getRecentMessagesByConversation(convKey, CONV_MAX_TURNS + 4).catch(() => []);
+  return rowsToConversationTurns(rows, currentMessageTs);
+}
+
 // ─── History builder ──────────────────────────────────────────────────────────
 
 async function buildHistory(
@@ -244,9 +272,13 @@ async function buildHistory(
   currentMessageTs: string,
   source: 'mention' | 'dm',
 ): Promise<ConversationTurn[]> {
-  // DMs: use in-memory store only (avoids pulling stale old messages from Slack)
+  // DMs: use memory first, then hydrate from Postgres after process restarts.
+  // This avoids pulling unbounded Slack DM history while still preserving recent
+  // Tangent context across PM2 restarts.
   if (source === 'dm') {
-    return _getHistory(convKey);
+    const memoryHistory = _getHistory(convKey);
+    if (memoryHistory.length > 0) return memoryHistory;
+    return hydrateHistoryFromDb(convKey, currentMessageTs);
   }
 
   // Channel threads: read the canonical Slack thread — naturally bounded,
@@ -287,7 +319,9 @@ async function buildHistory(
 
     return turns.slice(-CONV_MAX_TURNS);
   } catch {
-    return _getHistory(convKey); // fallback to in-memory on API failure
+    const memoryHistory = _getHistory(convKey);
+    if (memoryHistory.length > 0) return memoryHistory;
+    return hydrateHistoryFromDb(convKey, currentMessageTs);
   }
 }
 
@@ -360,10 +394,15 @@ export function initSlackBot(): void {
     }
 
     // Channel thread reply (not top-level, not an @mention) — only handle if
-    // Tangent has already posted in this thread. This avoids listening to every
-    // channel message while still giving full thread context after first mention.
-    if (threadTs && threadTs !== messageTs && _isActiveThread(channel, threadTs)) {
-      await route({ channel, threadTs, userId, client, text, source: 'mention', messageTs });
+    // Tangent has already posted in this thread. In memory covers the hot path;
+    // Postgres covers PM2 restarts so Tangent can keep participating in a
+    // recent thread without requiring another explicit @mention.
+    if (threadTs && threadTs !== messageTs) {
+      const convKey = _convKey(channel, threadTs, 'mention');
+      if (_isActiveThread(channel, threadTs) || await _isRecentlyActiveDbConversation(convKey)) {
+        _markActiveThread(channel, threadTs);
+        await route({ channel, threadTs, userId, client, text, source: 'mention', messageTs });
+      }
     }
   });
 
@@ -865,6 +904,11 @@ async function executeToolCall(
       // All read-only — handleInfoTool synthesises a conversational reply
       await handleInfoTool(call, ctx, convKey, userMessage, history, chainDepth);
       break;
+    case 'provision_app_database': {
+      const result = await handleProvisionAppDatabase(ctx, call.input as { repo: string; database_name?: string; username?: string; storage_env?: string }, convKey);
+      await _chainIfNeeded(call, result, ctx, convKey, userMessage, history);
+      break;
+    }
     case 'db_create_user': {
       const result = await handleDbCreateUser(ctx, call.input as { username: string; create_database?: boolean }, convKey);
       await _chainIfNeeded(call, result, ctx, convKey, userMessage, history);
@@ -905,7 +949,7 @@ function toolSignature(call: AgentToolCall): string {
 }
 
 function isMutatingChainTool(name: AgentToolCall['name']): boolean {
-  return ['put_secret', 'inject_secret', 'db_create_user', 'db_drop_user', 'bash'].includes(name);
+  return ['put_secret', 'inject_secret', 'provision_app_database', 'db_create_user', 'db_drop_user', 'bash'].includes(name);
 }
 
 function actionResultFailed(result: string): boolean {
@@ -1071,6 +1115,8 @@ async function dispatchChainedTool(
       return handlePutSecret(ctx, call.input as { name: string; value: string; description?: string }, convKey);
     case 'inject_secret':
       return handleInjectSecret(ctx, call.input as { repo: string; secret_name: string; env_var_name?: string }, convKey);
+    case 'provision_app_database':
+      return handleProvisionAppDatabase(ctx, call.input as { repo: string; database_name?: string; username?: string; storage_env?: string }, convKey);
     case 'db_create_user':
       return handleDbCreateUser(ctx, call.input as { username: string; create_database?: boolean }, convKey);
     case 'db_drop_user':
@@ -2616,6 +2662,107 @@ async function fetchDbListUsers(): Promise<string> {
     return `- *${u.rolname}*${flags.length > 0 ? ` _(${flags.join(', ')})_` : ''}`;
   });
   return `${users.length} Postgres role(s):\n${lines.join('\n')}`;
+}
+
+async function handleProvisionAppDatabase(
+  ctx: Ctx,
+  input: { repo: string; database_name?: string; username?: string; storage_env?: string },
+  convKey: string,
+): Promise<string> {
+  if (ctx.userId !== APPROVER_ID) {
+    const msg = '🔒 Only Daanish can provision app databases.';
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  }
+
+  const { pgConfigured, provisionAppDatabase, validateRoleName } = await import('./postgres.js');
+  if (!pgConfigured()) {
+    const msg = 'Postgres is not configured on this Tangent instance.';
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    return msg;
+  }
+  if (input.database_name && !validateRoleName(input.database_name)) {
+    const msg = `❌ Invalid database name "${input.database_name}" — must be lowercase alphanumeric+underscore, 2-63 chars, starting with a letter.`;
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  }
+  if (input.username && !validateRoleName(input.username)) {
+    const msg = `❌ Invalid role name "${input.username}" — must be lowercase alphanumeric+underscore, 2-63 chars, starting with a letter.`;
+    await post(ctx.client, ctx.channel, ctx.threadTs, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  }
+
+  const storageEnv = input.storage_env?.trim() || 'postgres';
+  const ts = await post(ctx.client, ctx.channel, ctx.threadTs, `⏳ Provisioning Postgres storage for \`${input.repo}\`...`);
+
+  try {
+    const db = await provisionAppDatabase({
+      repo: input.repo,
+      username: input.username,
+      databaseName: input.database_name,
+    });
+    const secretName = `${input.repo}/DB_PASSWORD`;
+    const savedSecret = await putSecret(
+      {
+        name: secretName,
+        value: db.password,
+        description: `Postgres password for ${input.repo} service role ${db.username}`,
+      },
+      { actor: ctx.userId ?? 'unknown', surface: 'slack' },
+    );
+    const configured = await configureServiceEnvironment(
+      {
+        repo: input.repo,
+        env: {
+          STORAGE: storageEnv,
+          DB_HOST: config().pgHostInternalIp,
+          DB_PORT: '5432',
+          DB_NAME: db.databaseName,
+          DB_USER: db.username,
+        },
+        secrets: [{ secretName: savedSecret.name, envVarName: 'DB_PASSWORD' }],
+      },
+      { actor: ctx.userId ?? 'unknown', surface: 'slack' },
+    );
+
+    await recordAuditEvent({
+      action: 'postgres:provision_app_database',
+      actor: ctx.userId ?? 'unknown',
+      surface: 'slack',
+      target: input.repo,
+      metadata: {
+        databaseName: db.databaseName,
+        username: db.username,
+        roleCreated: db.roleCreated,
+        databaseCreated: db.databaseCreated,
+        secretName: savedSecret.name,
+        taskDefinitionArn: configured.taskDefinitionArn,
+      },
+    });
+
+    const msg = [
+      `✅ *Postgres storage provisioned for \`${input.repo}\`*`,
+      `Database: \`${db.databaseName}\` ${db.databaseCreated ? '(created)' : '(already existed)'}`,
+      `Role: \`${db.username}\` ${db.roleCreated ? '(created)' : '(password rotated)'}`,
+      `Secret: \`${savedSecret.name}\` → \`DB_PASSWORD\``,
+      `Injected env: \`STORAGE=${storageEnv}\`, \`DB_HOST=${config().pgHostInternalIp}\`, \`DB_PORT=5432\`, \`DB_NAME=${db.databaseName}\`, \`DB_USER=${db.username}\``,
+      configured.changed
+        ? `ECS task definition updated: \`${configured.taskDefinitionArn}\``
+        : `ECS task definition already had the requested DB env wiring.`,
+    ].join('\n');
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+
+    return `Provisioned Postgres storage for ${input.repo}: database=${db.databaseName}, user=${db.username}, DB_PASSWORD secret=${savedSecret.name}.`;
+  } catch (err) {
+    const msg = `❌ Failed to provision Postgres storage for \`${input.repo}\`: ${err instanceof Error ? err.message : String(err)}`;
+    await update(ctx.client, ctx.channel, ts, msg);
+    _appendTurn(convKey, { role: 'assistant', content: msg });
+    return msg;
+  }
 }
 
 async function handleDbCreateUser(
