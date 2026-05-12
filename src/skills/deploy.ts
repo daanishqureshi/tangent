@@ -20,6 +20,7 @@ import {
   DescribeTaskDefinitionCommand,
   ListTaskDefinitionsCommand,
   type ContainerDefinition,
+  type KeyValuePair,
   type LogConfiguration,
   type Secret,
 } from '@aws-sdk/client-ecs';
@@ -96,13 +97,20 @@ export async function deploySkill(input: DeployInput): Promise<DeployOutput> {
 
   // Inject DB connection constants into every app container so services can reach
   // the shared Postgres on the Tangent EC2 without any extra inject_secret steps.
-  // DB_PASSWORD is NOT injected here — services request it via inject_secret when
-  // they need write access.  Service-supplied env vars override these defaults.
+  // Also preserve plain env vars from the previous task definition, including
+  // DB_NAME/STORAGE injected by provision_app_database. Service-supplied env vars
+  // override inherited values and defaults.
   const dbDefaults: Record<string, string> = {
     DB_HOST: pgHostInternalIp,
     DB_PORT: '5432',
   };
-  const mergedEnv: Record<string, string> = { ...dbDefaults, ...env };
+  const inheritedEnv = await fetchExistingAppEnvironment(taskFamily);
+  const inheritedEnvByName = Object.fromEntries(
+    inheritedEnv
+      .filter((entry) => entry.name && entry.value !== undefined)
+      .map((entry) => [entry.name as string, entry.value as string]),
+  );
+  const mergedEnv: Record<string, string> = { ...dbDefaults, ...inheritedEnvByName, ...env };
   const appEnv = Object.entries(mergedEnv).map(([name, value]) => ({ name, value }));
 
   const appLogConfig: LogConfiguration = {
@@ -515,6 +523,27 @@ async function fetchExistingAppSecrets(taskFamily: string): Promise<Secret[]> {
     }));
     const appContainer = descResult.taskDefinition?.containerDefinitions?.find((c) => c.name === 'app');
     return appContainer?.secrets ?? [];
+  } catch {
+    return []; // no previous revision or API error — start fresh
+  }
+}
+
+async function fetchExistingAppEnvironment(taskFamily: string): Promise<KeyValuePair[]> {
+  try {
+    const listResult = await ecsClient().send(new ListTaskDefinitionsCommand({
+      familyPrefix: taskFamily,
+      sort: 'DESC',
+      maxResults: 1,
+      status: 'ACTIVE',
+    }));
+    const latestArn = listResult.taskDefinitionArns?.[0];
+    if (!latestArn) return [];
+
+    const descResult = await ecsClient().send(new DescribeTaskDefinitionCommand({
+      taskDefinition: latestArn,
+    }));
+    const appContainer = descResult.taskDefinition?.containerDefinitions?.find((c) => c.name === 'app');
+    return appContainer?.environment ?? [];
   } catch {
     return []; // no previous revision or API error — start fresh
   }
