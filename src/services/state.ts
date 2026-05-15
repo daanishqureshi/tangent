@@ -56,6 +56,12 @@ export async function addAllowedUserToDb(userId: string, displayName?: string, s
   );
 }
 
+export async function ensureAllowedUserInDb(userId: string, displayName?: string, source = 'runtime'): Promise<boolean> {
+  if (!pgConfigured()) return false;
+  await addAllowedUserToDb(userId, displayName, source);
+  return await isAllowedUserInDb(userId) === true;
+}
+
 export async function seedAllowedUsersToDb(userIds: Iterable<string>, source = 'bootstrap'): Promise<number> {
   if (!pgConfigured()) return 0;
   let count = 0;

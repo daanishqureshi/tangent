@@ -33,7 +33,7 @@ import { listAllRepos, inspectRepo, pushFile, readRepoFile, listCommits, editFil
 import { listSecrets, putSecret, injectSecretIntoService, configureServiceEnvironment } from './environment.js';
 import { recordAuditEvent } from './audit.js';
 import { getRecentMessagesByConversation, recordConversationMessageLater, recordToolEvent, recordToolEventLater, type ConversationMessageRow, type ConversationSource } from './conversations.js';
-import { addAllowedUserToDb, getServiceUrl, isAllowedUserInDb, rememberPersonInDb } from './state.js';
+import { ensureAllowedUserInDb, getServiceUrl, isAllowedUserInDb, rememberPersonInDb } from './state.js';
 import { APPROVER_ID, BASH_ALLOWED_USER_IDS } from './policy.js';
 import { logger } from '../utils/logger.js';
 
@@ -214,11 +214,25 @@ function _conversationSource(source: 'mention' | 'dm'): ConversationSource {
 async function isAllowedSlackUser(userId: string | undefined): Promise<boolean> {
   if (!userId) return false;
   const dbAllowed = await isAllowedUserInDb(userId);
-  if (dbAllowed !== null) return dbAllowed;
+  const { allowedSlackUserIds } = config();
+  const bootstrapHasUser = allowedSlackUserIds.has(userId);
+  const fallbackAllowsUser = allowedSlackUserIds.size === 0 || bootstrapHasUser;
+
+  if (dbAllowed === true) return true;
+  if (dbAllowed === false) {
+    if (!bootstrapHasUser) return false;
+
+    // Self-heal stale DB state: if a user exists in the bootstrap/runtime cache
+    // but not Postgres, persist them and allow this request.
+    const persisted = await ensureAllowedUserInDb(userId, undefined, 'bootstrap_self_heal').catch((err) => {
+      logger.warn({ action: 'state:allowed_user_self_heal_failed', userId, err }, 'Failed to self-heal allowed user into DB');
+      return false;
+    });
+    return persisted || bootstrapHasUser;
+  }
 
   // Fallback for local dev or DB outage: use env/json-hydrated bootstrap cache.
-  const { allowedSlackUserIds } = config();
-  return allowedSlackUserIds.size === 0 || allowedSlackUserIds.has(userId);
+  return fallbackAllowsUser;
 }
 
 async function _isRecentlyActiveDbConversation(convKey: string): Promise<boolean> {
@@ -518,12 +532,14 @@ async function route(opts: Ctx & { text: string; source: 'mention' | 'dm'; messa
     }
     const newUserId = addUserMatch[1]!;
     const result = allowUser(newUserId);
-    await addAllowedUserToDb(newUserId, undefined, 'slack_fast_path');
+    const persisted = await ensureAllowedUserInDb(newUserId, undefined, 'slack_fast_path');
     let msg: string;
-    if (result.alreadyAllowed) {
-      msg = `ℹ️ <@${newUserId}> is already on the allowed list.`;
+    if (persisted && result.alreadyAllowed) {
+      msg = `ℹ️ <@${newUserId}> is already allowed and is present in \`tangent_app.allowed_users\`.`;
+    } else if (persisted) {
+      msg = `✅ <@${newUserId}> has been added to \`tangent_app.allowed_users\`.`;
     } else {
-      msg = `✅ <@${newUserId}> has been added to the allowed users table.`;
+      msg = `⚠️ <@${newUserId}> was added to the runtime cache, but I could not verify \`tangent_app.allowed_users\`. Restarting Tangent may lose this access until DB writes recover.`;
     }
     await post(ctx.client, ctx.channel, ctx.threadTs, msg);
     return;
@@ -861,12 +877,14 @@ async function executeToolCall(
         break;
       }
       const result = allowUser(user_id);
-      await addAllowedUserToDb(user_id, display_name, 'slack_tool');
+      const persisted = await ensureAllowedUserInDb(user_id, display_name, 'slack_tool');
       let msg: string;
-      if (result.alreadyAllowed) {
-        msg = `ℹ️ <@${user_id}> (${display_name}) is already on the allowed list — no change needed.`;
-      } else {
+      if (persisted && result.alreadyAllowed) {
+        msg = `ℹ️ <@${user_id}> (${display_name}) is already allowed and is present in \`tangent_app.allowed_users\`.`;
+      } else if (persisted) {
         msg = `✅ Done — <@${user_id}> (${display_name}) now has access to Tangent. Persisted to \`tangent_app.allowed_users\`.`;
+      } else {
+        msg = `⚠️ <@${user_id}> (${display_name}) was added to the runtime cache, but I could not verify \`tangent_app.allowed_users\`. Restarting Tangent may lose this access until DB writes recover.`;
       }
       await post(ctx.client, ctx.channel, ctx.threadTs, msg);
       _appendTurn(convKey, { role: 'assistant', content: msg });
