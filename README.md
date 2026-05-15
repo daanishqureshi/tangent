@@ -136,7 +136,7 @@ flowchart TD
   DeployedTask --> Ngrok["ngrok stable URL\nGoogle OAuth domains"]
   Ngrok --> PublicUsers["Approved Google domains\nimpiricus.com and docupdate.io"]
 
-  ConfigFiles["Fallback repo files\nconfig/people.json\nconfig/allowed_users.json\nconfig/ngrok-urls.json"] -. "bootstrap and fallback" .-> Services
+  ConfigFiles["Fallback repo files\nconfig/allowed_users.json\nconfig/ngrok-urls.json"] -. "bootstrap and fallback" .-> Services
   AuditJsonl["Fallback log file\nlogs/audit.jsonl"] -. "fallback audit trail" .-> Services
 ```
 
@@ -374,7 +374,7 @@ tangent/
 ├── src/                          ← Main service (TypeScript, ESM)
 │   ├── index.ts                  ← entry: load config → init clients → start Fastify + Slack + cron
 │   ├── server.ts                 ← Fastify factory (used by index + tests)
-│   ├── config.ts                 ← env + Secrets Manager loader, allowUser(), peopleNotes
+│   ├── config.ts                 ← env + Secrets Manager loader, allowUser(), DB-hydrated peopleNotes
 │   │
 │   ├── routes/                   ← Fastify HTTP API
 │   │   ├── health.ts             GET  /health
@@ -421,7 +421,6 @@ tangent/
 │
 ├── config/                       ← Persistent state (committed to git)
 │   ├── allowed_users.json        Slack user IDs who may talk to Tangent
-│   ├── people.json               long-term memory notes per Slack user ID
 │   └── ngrok-urls.json           { repo: stable-ngrok-url } registry
 │
 ├── scripts/
@@ -567,8 +566,8 @@ Defined in `src/services/ai.ts` → `TOOLS`. Claude sees these and decides which
 | `list_secrets`      | info   | Secret **names** in AWS Secrets Manager (never values)                                    |
 | `put_secret`        | action | Create/update a secret in Secrets Manager (Daanish only)                                  |
 | `inject_secret`     | action | Wire a Secrets Manager secret as an env var into a deployed ECS service (Daanish only)    |
-| `allow_user`        | action | Add a Slack user ID to the allowlist + persist to git (Daanish only)                      |
-| `remember_person`   | action | Save a long-term note about someone to `config/people.json` (memory)                      |
+| `allow_user`        | action | Add a Slack user ID to the DB-backed allowlist (Daanish only)                             |
+| `remember_person`   | action | Save a long-term note about someone to Tangent DB                                         |
 
 ### Multi-step agent loops
 
@@ -802,21 +801,7 @@ The system prompt embeds a hard-coded roster of known Impiricus engineers with t
 
 ## Memory & personalisation
 
-Tangent has long-term memory in `config/people.json`:
-
-```json
-{
-  "people": [
-    { "id": "U07EU7KSG3U", "name": "Daanish Qureshi", "notes": [
-        "VP of AI Engineering — built Tangent",
-        "Approves all deploys",
-        "..."
-    ]}
-  ]
-}
-```
-
-These notes are spliced into the system prompt at every Claude call. The `remember_person` tool lets Tangent _add_ to its own memory mid-conversation — Claude is instructed to call it proactively whenever it learns something notable about someone (a habit, a project, a role change). The file is committed and pushed to git like any other config update.
+Tangent stores long-term memory in Postgres (`tangent_app.memories`). Relevant memories are retrieved into the system prompt at each Claude call, and the `remember_person` tool writes person notes directly to the DB while updating the current process cache for immediate use.
 
 ---
 
@@ -1002,7 +987,7 @@ If you want a one-line index of every important file:
 |-----------------------------------------------|-------|------------------------------------------------------------------|
 | `src/index.ts`                                | 92    | Entry point: load → init → listen → cron                         |
 | `src/server.ts`                               | 62    | Fastify factory                                                  |
-| `src/config.ts`                               | 275   | Env + Secrets Manager + allowUser() + peopleNotes                |
+| `src/config.ts`                               | 275   | Env + Secrets Manager + allowUser() + DB-hydrated peopleNotes    |
 | `src/services/ai.ts`                          | 1001  | Anthropic SDK wrapper, TOOLS schema, system prompt               |
 | `src/services/slack-bot.ts`                   | 1549  | Bolt app, router, conversation store, executors, auto-fix       |
 | `src/services/slack.ts`                       | 178   | Block Kit notification helpers                                   |
@@ -1029,7 +1014,6 @@ If you want a one-line index of every important file:
 | `scripts/iam-policy.json`                     | 67    | Tangent's IAM permissions                                        |
 | `slack-app-manifest.json`                     | 44    | Slack app definition (Socket Mode)                               |
 | `config/allowed_users.json`                   | —     | Allowlist (mutated by `allowUser`)                               |
-| `config/people.json`                          | —     | Long-term memory notes per user                                  |
 | `config/ngrok-urls.json`                      | —     | Stable ngrok URL registry per repo                               |
 
 ---

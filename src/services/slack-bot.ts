@@ -3089,69 +3089,36 @@ async function handleRememberPerson(
   input: { user_id: string; name: string; note: string },
   convKey: string,
 ): Promise<string> {
-  const { readFileSync, writeFileSync } = await import('fs');
-  const { resolve } = await import('path');
-  const { execSync } = await import('child_process');
-
-  const peopleFile = resolve(process.cwd(), 'config/people.json');
-
   let persisted = false;
-  let commitSha: string | undefined;
   let errMsg: string | undefined;
 
   try {
-    type PersonEntry = { id: string; name: string; notes: string[] };
-    let people: PersonEntry[] = [];
-    try {
-      people = (JSON.parse(readFileSync(peopleFile, 'utf8')) as { people: PersonEntry[] }).people;
-    } catch { /* file missing — start fresh */ }
+    await rememberPersonInDb({
+      userId: input.user_id,
+      name: input.name,
+      note: input.note,
+      source: 'remember_person_tool',
+    });
+    persisted = true;
 
+    // Also update DB-hydrated runtime context for this process so the new note
+    // is available immediately without waiting for the next restart.
+    const people = config().peopleNotes;
     const existing = people.find((p) => p.id === input.user_id);
     if (existing) {
       if (!existing.notes.includes(input.note)) {
         existing.notes.push(input.note);
       }
+      existing.name = input.name || existing.name;
     } else {
       people.push({ id: input.user_id, name: input.name, notes: [input.note] });
     }
-
-    writeFileSync(peopleFile, JSON.stringify({ people }, null, 2));
-
-    // Also update in-memory config so the current session has the new note
     config().peopleNotes = people;
-    try {
-      await rememberPersonInDb({
-        userId: input.user_id,
-        name: input.name,
-        note: input.note,
-        source: 'remember_person_tool',
-      });
-    } catch (err) {
-      logger.warn({ action: 'remember_person:db_failed', err }, 'Failed to persist person memory to DB');
-    }
 
-    // Push to currently checked-out branch, not hardcoded `main` — EC2 was
-    // historically on `master` and hardcoding a branch meant these commits
-    // landed locally and never reached origin. Same fix as allowUser().
-    const currentBranch = execSync(`git -C "${process.cwd()}" rev-parse --abbrev-ref HEAD`, { stdio: ['pipe', 'pipe', 'pipe'] })
-      .toString().trim();
-
-    execSync(
-      `git -C "${process.cwd()}" add config/people.json && ` +
-      `git -C "${process.cwd()}" -c user.name="Tangent" -c user.email="tangent@impiricus.com" ` +
-      `commit -m "memory: remember note about ${input.name}" && ` +
-      `git -C "${process.cwd()}" push origin ${currentBranch}`,
-      { stdio: 'pipe' },
-    );
-    persisted = true;
-    try {
-      commitSha = execSync(`git -C "${process.cwd()}" rev-parse --short HEAD`, { stdio: ['pipe', 'pipe', 'pipe'] })
-        .toString().trim();
-    } catch { /* best-effort */ }
-    logger.info({ action: 'remember_person:persisted', userId: input.user_id, commitSha }, 'Memory saved to GitHub');
+    logger.info({ action: 'remember_person:persisted', userId: input.user_id }, 'Memory saved to DB');
   } catch (err) {
     errMsg = err instanceof Error ? err.message : String(err);
-    logger.warn({ action: 'remember_person:failed', err: errMsg }, 'Failed to persist person memory');
+    logger.warn({ action: 'remember_person:failed', err: errMsg }, 'Failed to persist person memory to DB');
   }
 
   // Always post a visible confirmation — without it, the DM conversation store
@@ -3160,10 +3127,9 @@ async function handleRememberPerson(
   const notePreview = input.note.length > 140 ? input.note.slice(0, 140) + '…' : input.note;
   let msg: string;
   if (persisted) {
-    const shaNote = commitSha ? ` (commit \`${commitSha}\`)` : '';
-    msg = `🧠 Noted about *${input.name}*: _${notePreview}_\nSaved to \`config/people.json\` and pushed to \`main\`${shaNote}.`;
+    msg = `🧠 Noted about *${input.name}*: _${notePreview}_\nSaved to Tangent DB.`;
   } else if (errMsg) {
-    msg = `🧠 Noted about *${input.name}* in memory: _${notePreview}_\n⚠️ Could NOT push to GitHub: _${errMsg}_ — the note will be lost on next restart.`;
+    msg = `⚠️ Could not save memory about *${input.name}* to Tangent DB: _${errMsg}_`;
   } else {
     msg = `🧠 Noted about *${input.name}*: _${notePreview}_`;
   }

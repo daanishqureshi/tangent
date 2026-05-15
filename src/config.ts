@@ -21,7 +21,6 @@ import { logger } from './utils/logger.js';
 // the compiled file at dist/config.js, making relative paths one level off.
 const PROJECT_ROOT       = process.cwd();
 const ALLOWED_USERS_FILE = resolve(PROJECT_ROOT, 'config/allowed_users.json');
-const PEOPLE_FILE        = resolve(PROJECT_ROOT, 'config/people.json');
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -214,11 +213,8 @@ export async function loadConfig(): Promise<Config> {
       .map((id) => id.trim())
       .filter(Boolean),
   );
-  // Load per-person context notes
-  let peopleNotes: Array<{ id: string; name: string; notes: string[] }> = [];
-  try {
-    peopleNotes = (JSON.parse(readFileSync(PEOPLE_FILE, 'utf8')) as { people: typeof peopleNotes }).people;
-  } catch { /* file missing — fine */ }
+  // Per-person context is hydrated from Postgres at startup.
+  const peopleNotes: Array<{ id: string; name: string; notes: string[] }> = [];
 
   // Merge in any users persisted via allowUser() across previous restarts
   try {

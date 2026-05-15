@@ -4,13 +4,13 @@ import { pgConfigured, queryPool } from './postgres.js';
 import { logger } from '../utils/logger.js';
 
 export async function buildMemoryContextForPrompt(message?: string): Promise<string> {
-  const fallback = buildPeopleNotesFallback();
+  const runtimePeopleNotes = buildRuntimePeopleNotesContext();
 
   try {
-    if (!pgConfigured()) return fallback;
+    if (!pgConfigured()) return runtimePeopleNotes;
     const userId = extractSlackUserId(message ?? '');
     const memories = await queryRelevantMemories(userId, message ?? '');
-    if (memories.length === 0) return fallback;
+    if (memories.length === 0) return runtimePeopleNotes;
 
     const lines = memories.map((m) =>
       `- [memory:${m.id}] (${m.kind}/${m.subject_type}:${m.subject_id}, importance ${m.importance}) ${m.content}`,
@@ -21,17 +21,17 @@ export async function buildMemoryContextForPrompt(message?: string): Promise<str
       ...lines,
     ].join('\n');
   } catch (err) {
-    logger.warn({ action: 'memory_context:failed', err }, 'Failed to build memory context; using config fallback');
-    return fallback;
+    logger.warn({ action: 'memory_context:failed', err }, 'Failed to build memory context; using runtime DB-hydrated notes');
+    return runtimePeopleNotes;
   }
 }
 
-function buildPeopleNotesFallback(): string {
+function buildRuntimePeopleNotesContext(): string {
   const { peopleNotes } = config();
   if (peopleNotes.length === 0) return '';
 
   return '\n\n*Memories — what you know about specific people:*\n' +
-    '*This section is fallback long-term memory loaded from config/people.json.*\n' +
+    '*This section is runtime long-term memory hydrated from Tangent DB.*\n' +
     peopleNotes.map((p) =>
       `\n*${p.name}* (${p.id}):\n` + p.notes.map((n) => `  - ${n}`).join('\n')
     ).join('\n');
